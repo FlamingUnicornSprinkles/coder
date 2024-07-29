@@ -2258,6 +2258,7 @@ export type RBACResource =
   | "file"
   | "group"
   | "license"
+  | "notification_preference"
   | "notification_template"
   | "oauth2_app"
   | "oauth2_app_code_token"
@@ -2286,6 +2287,7 @@ export const RBACResources: RBACResource[] = [
   "file",
   "group",
   "license",
+  "notification_preference",
   "notification_template",
   "oauth2_app",
   "oauth2_app_code_token",
