@@ -9763,6 +9763,9 @@ const docTemplate = `{
                 "avatar_url": {
                     "type": "string"
                 },
+                "id": {
+                    "type": "integer"
+                },
                 "login": {
                     "type": "string"
                 },
