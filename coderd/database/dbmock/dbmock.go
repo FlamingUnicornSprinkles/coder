@@ -4536,10 +4536,10 @@ func (mr *MockStoreMockRecorder) UpdateUserLoginType(arg0, arg1 any) *gomock.Cal
 }
 
 // UpdateUserNotificationPreferences mocks base method.
-func (m *MockStore) UpdateUserNotificationPreferences(arg0 context.Context, arg1 database.UpdateUserNotificationPreferencesParams) (int64, error) {
+func (m *MockStore) UpdateUserNotificationPreferences(arg0 context.Context, arg1 database.UpdateUserNotificationPreferencesParams) ([]database.NotificationPreference, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "UpdateUserNotificationPreferences", arg0, arg1)
-	ret0, _ := ret[0].(int64)
+	ret0, _ := ret[0].([]database.NotificationPreference)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }

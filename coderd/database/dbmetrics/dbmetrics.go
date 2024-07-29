@@ -2160,7 +2160,7 @@ func (m metricsStore) UpdateUserLoginType(ctx context.Context, arg database.Upda
 	return r0, r1
 }
 
-func (m metricsStore) UpdateUserNotificationPreferences(ctx context.Context, arg database.UpdateUserNotificationPreferencesParams) (int64, error) {
+func (m metricsStore) UpdateUserNotificationPreferences(ctx context.Context, arg database.UpdateUserNotificationPreferencesParams) ([]database.NotificationPreference, error) {
 	start := time.Now()
 	r0, r1 := m.s.UpdateUserNotificationPreferences(ctx, arg)
 	m.queryLatencies.WithLabelValues("UpdateUserNotificationPreferences").Observe(time.Since(start).Seconds())

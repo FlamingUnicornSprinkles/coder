@@ -8232,20 +8232,21 @@ func (q *FakeQuerier) UpdateUserLoginType(_ context.Context, arg database.Update
 	return database.User{}, sql.ErrNoRows
 }
 
-func (q *FakeQuerier) UpdateUserNotificationPreferences(ctx context.Context, arg database.UpdateUserNotificationPreferencesParams) (int64, error) {
+func (q *FakeQuerier) UpdateUserNotificationPreferences(ctx context.Context, arg database.UpdateUserNotificationPreferencesParams) ([]database.NotificationPreference, error) {
 	err := validateDatabaseType(arg)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
-	var upserted int64
-	for i, templateID := range arg.NotificationTemplateIds {
+	var out []database.NotificationPreference
+	for i := range arg.NotificationTemplateIds {
 		var (
-			found    *database.NotificationPreference
-			disabled = arg.Disableds[i]
+			found      bool
+			templateID = arg.NotificationTemplateIds[i]
+			disabled   = arg.Disableds[i]
 		)
 
 		for _, np := range q.notificationPreferences {
@@ -8253,24 +8254,28 @@ func (q *FakeQuerier) UpdateUserNotificationPreferences(ctx context.Context, arg
 				continue
 			}
 
-			found = &np
+			np.Disabled = disabled
+			np.UpdatedAt = time.Now()
+			out = append(out, np)
+			found = true
+			break
 		}
 
-		if found != nil {
-			found.Disabled = disabled
-			found.UpdatedAt = time.Now()
-		} else {
-			q.notificationPreferences = append(q.notificationPreferences, database.NotificationPreference{
+		if !found {
+			np := database.NotificationPreference{
 				Disabled:               disabled,
 				UserID:                 arg.UserID,
 				NotificationTemplateID: templateID,
 				CreatedAt:              time.Now(),
 				UpdatedAt:              time.Now(),
-			})
+			}
+			q.notificationPreferences = append(q.notificationPreferences, np)
+
+			out = append(out, np)
 		}
 	}
 
-	return upserted, nil
+	return out, nil
 }
 
 func (q *FakeQuerier) UpdateUserProfile(_ context.Context, arg database.UpdateUserProfileParams) (database.User, error) {

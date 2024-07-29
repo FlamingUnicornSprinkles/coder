@@ -3349,9 +3349,9 @@ func (q *querier) UpdateUserLoginType(ctx context.Context, arg database.UpdateUs
 	return q.db.UpdateUserLoginType(ctx, arg)
 }
 
-func (q *querier) UpdateUserNotificationPreferences(ctx context.Context, arg database.UpdateUserNotificationPreferencesParams) (int64, error) {
+func (q *querier) UpdateUserNotificationPreferences(ctx context.Context, arg database.UpdateUserNotificationPreferencesParams) ([]database.NotificationPreference, error) {
 	if err := q.authorizeContext(ctx, policy.ActionUpdatePersonal, rbac.ResourceUserObject(arg.UserID)); err != nil {
-		return -1, err
+		return nil, err
 	}
 	return q.db.UpdateUserNotificationPreferences(ctx, arg)
 }

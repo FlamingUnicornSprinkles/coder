@@ -3762,7 +3762,7 @@ func (q *sqlQuerier) UpdateNotificationTemplateMethodById(ctx context.Context, a
 	return i, err
 }
 
-const updateUserNotificationPreferences = `-- name: UpdateUserNotificationPreferences :execrows
+const updateUserNotificationPreferences = `-- name: UpdateUserNotificationPreferences :many
 WITH new_values AS
          (SELECT UNNEST($2::uuid[]) AS notification_template_id,
                  UNNEST($3::bool[])                 AS disabled)
@@ -3773,6 +3773,7 @@ FROM new_values
 ON CONFLICT (user_id, notification_template_id) DO UPDATE
     SET disabled   = EXCLUDED.disabled,
         updated_at = CURRENT_TIMESTAMP
+RETURNING user_id, notification_template_id, disabled, created_at, updated_at
 `
 
 type UpdateUserNotificationPreferencesParams struct {
@@ -3781,12 +3782,33 @@ type UpdateUserNotificationPreferencesParams struct {
 	Disableds               []bool      `db:"disableds" json:"disableds"`
 }
 
-func (q *sqlQuerier) UpdateUserNotificationPreferences(ctx context.Context, arg UpdateUserNotificationPreferencesParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, updateUserNotificationPreferences, arg.UserID, pq.Array(arg.NotificationTemplateIds), pq.Array(arg.Disableds))
+func (q *sqlQuerier) UpdateUserNotificationPreferences(ctx context.Context, arg UpdateUserNotificationPreferencesParams) ([]NotificationPreference, error) {
+	rows, err := q.db.QueryContext(ctx, updateUserNotificationPreferences, arg.UserID, pq.Array(arg.NotificationTemplateIds), pq.Array(arg.Disableds))
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected()
+	defer rows.Close()
+	var items []NotificationPreference
+	for rows.Next() {
+		var i NotificationPreference
+		if err := rows.Scan(
+			&i.UserID,
+			&i.NotificationTemplateID,
+			&i.Disabled,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const deleteOAuth2ProviderAppByID = `-- name: DeleteOAuth2ProviderAppByID :exec

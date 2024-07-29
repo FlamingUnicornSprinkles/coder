@@ -145,7 +145,7 @@ SELECT *
 FROM notification_preferences
 WHERE user_id = @user_id::uuid;
 
--- name: UpdateUserNotificationPreferences :execrows
+-- name: UpdateUserNotificationPreferences :many
 WITH new_values AS
          (SELECT UNNEST(@notification_template_ids::uuid[]) AS notification_template_id,
                  UNNEST(@disableds::bool[])                 AS disabled)
@@ -155,7 +155,8 @@ SELECT @user_id::uuid, new_values.notification_template_id, new_values.disabled
 FROM new_values
 ON CONFLICT (user_id, notification_template_id) DO UPDATE
     SET disabled   = EXCLUDED.disabled,
-        updated_at = CURRENT_TIMESTAMP;
+        updated_at = CURRENT_TIMESTAMP
+RETURNING *;
 
 -- name: UpdateNotificationTemplateMethodById :one
 UPDATE notification_templates
