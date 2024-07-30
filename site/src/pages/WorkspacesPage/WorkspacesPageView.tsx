@@ -61,7 +61,7 @@ export interface WorkspacesPageViewProps {
   canCheckWorkspaces: boolean;
   templatesFetchStatus: TemplateQuery["status"];
   templates: TemplateQuery["data"];
-  canCreateTemplate: boolean;
+  canCreateAnyTemplate: boolean;
   canChangeVersions: boolean;
 }
 
@@ -84,7 +84,7 @@ export const WorkspacesPageView = ({
   canCheckWorkspaces,
   templates,
   templatesFetchStatus,
-  canCreateTemplate,
+  canCreateAnyTemplate,
   canChangeVersions,
 }: WorkspacesPageViewProps) => {
   // Let's say the user has 5 workspaces, but tried to hit page 100, which does
@@ -207,7 +207,7 @@ export const WorkspacesPageView = ({
         />
       ) : (
         <WorkspacesTable
-          canCreateTemplate={canCreateTemplate}
+          canCreateAnyTemplate={canCreateAnyTemplate}
           workspaces={workspaces}
           isUsingFilter={filterProps.filter.used}
           onUpdateWorkspace={onUpdateWorkspace}

@@ -8,9 +8,9 @@ import { TableEmpty } from "components/TableEmpty/TableEmpty";
 export const WorkspacesEmpty = (props: {
   isUsingFilter: boolean;
   templates?: Template[];
-  canCreateTemplate: boolean;
+  canCreateAnyTemplate: boolean;
 }) => {
-  const { isUsingFilter, templates, canCreateTemplate } = props;
+  const { isUsingFilter, templates, canCreateAnyTemplate } = props;
   const totalFeaturedTemplates = 6;
   const featuredTemplates = templates?.slice(0, totalFeaturedTemplates);
   const defaultTitle = "Create a workspace";
@@ -38,7 +38,7 @@ export const WorkspacesEmpty = (props: {
     return <TableEmpty message="No results matched your search" />;
   }
 
-  if (templates && templates.length === 0 && canCreateTemplate) {
+  if (templates && templates.length === 0 && canCreateAnyTemplate) {
     return (
       <TableEmpty
         message={defaultTitle}
@@ -61,7 +61,7 @@ export const WorkspacesEmpty = (props: {
     );
   }
 
-  if (templates && templates.length === 0 && !canCreateTemplate) {
+  if (templates && templates.length === 0 && !canCreateAnyTemplate) {
     return (
       <TableEmpty
         message={defaultTitle}

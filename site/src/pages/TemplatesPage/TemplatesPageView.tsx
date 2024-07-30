@@ -154,14 +154,14 @@ export interface TemplatesPageViewProps {
   error?: unknown;
   examples: TemplateExample[] | undefined;
   templates: Template[] | undefined;
-  canCreateTemplates: boolean;
+  canCreateAnyTemplate: boolean;
 }
 
 export const TemplatesPageView: FC<TemplatesPageViewProps> = ({
   templates,
   error,
   examples,
-  canCreateTemplates,
+  canCreateAnyTemplate,
 }) => {
   const isLoading = !templates;
   const isEmpty = templates && templates.length === 0;
@@ -171,7 +171,7 @@ export const TemplatesPageView: FC<TemplatesPageViewProps> = ({
     <Margins>
       <PageHeader
         actions={
-          canCreateTemplates && <CreateTemplateButton onNavigate={navigate} />
+          canCreateAnyTemplate && <CreateTemplateButton onNavigate={navigate} />
         }
       >
         <PageHeaderTitle>
@@ -206,7 +206,7 @@ export const TemplatesPageView: FC<TemplatesPageViewProps> = ({
 
               {isEmpty ? (
                 <EmptyTemplates
-                  canCreateTemplates={canCreateTemplates}
+                  canCreateAnyTemplate={canCreateAnyTemplate}
                   examples={examples ?? []}
                 />
               ) : (

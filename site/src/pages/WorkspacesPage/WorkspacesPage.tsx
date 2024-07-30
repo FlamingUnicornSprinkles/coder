@@ -84,8 +84,10 @@ const WorkspacesPage: FC = () => {
       </Helmet>
 
       <WorkspacesPageView
-        canCreateTemplate={permissions.createTemplates}
-        canChangeVersions={permissions.updateTemplates}
+        canCreateAnyTemplate={permissions.createAnyTemplate}
+        // TODO: Does it make sense to allow org admins too if the selected
+        //       templates belong to their org?
+        canChangeVersions={permissions.updateAllTemplates}
         checkedWorkspaces={checkedWorkspaces}
         onCheckChange={setCheckedWorkspaces}
         canCheckWorkspaces={canCheckWorkspaces}

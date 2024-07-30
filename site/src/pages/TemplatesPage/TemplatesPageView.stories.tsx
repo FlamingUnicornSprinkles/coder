@@ -19,7 +19,7 @@ type Story = StoryObj<typeof TemplatesPageView>;
 
 export const WithTemplates: Story = {
   args: {
-    canCreateTemplates: true,
+    canCreateAnyTemplate: true,
     error: undefined,
     templates: [
       MockTemplate,
@@ -69,7 +69,7 @@ export const WithTemplates: Story = {
 
 export const EmptyCanCreate: Story = {
   args: {
-    canCreateTemplates: true,
+    canCreateAnyTemplate: true,
     error: undefined,
     templates: [],
     examples: [MockTemplateExample, MockTemplateExample2],
@@ -81,7 +81,7 @@ export const EmptyCannotCreate: Story = {
     error: undefined,
     templates: [],
     examples: [MockTemplateExample, MockTemplateExample2],
-    canCreateTemplates: false,
+    canCreateAnyTemplate: false,
   },
 };
 
@@ -92,6 +92,6 @@ export const Error: Story = {
     }),
     templates: undefined,
     examples: undefined,
-    canCreateTemplates: false,
+    canCreateAnyTemplate: false,
   },
 };

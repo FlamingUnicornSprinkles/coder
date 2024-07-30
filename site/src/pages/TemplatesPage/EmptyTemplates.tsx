@@ -36,17 +36,17 @@ const findFeaturedExamples = (examples: TemplateExample[]) => {
 };
 
 interface EmptyTemplatesProps {
-  canCreateTemplates: boolean;
+  canCreateAnyTemplate: boolean;
   examples: TemplateExample[];
 }
 
 export const EmptyTemplates: FC<EmptyTemplatesProps> = ({
-  canCreateTemplates,
+  canCreateAnyTemplate,
   examples,
 }) => {
   const featuredExamples = findFeaturedExamples(examples);
 
-  if (canCreateTemplates) {
+  if (canCreateAnyTemplate) {
     return (
       <TableEmpty
         message="Create your first template"

@@ -2,10 +2,9 @@ export const checks = {
   viewAllUsers: "viewAllUsers",
   updateUsers: "updateUsers",
   createUser: "createUser",
-  createTemplates: "createTemplates",
-  updateTemplates: "updateTemplates",
-  deleteTemplates: "deleteTemplates",
   viewAuditLog: "viewAuditLog",
+  createAnyTemplate: "createAnyTemplate",
+  updateAllTemplates: "updateAllTemplates",
   viewDeploymentValues: "viewDeploymentValues",
   createGroup: "createGroup",
   viewUpdateCheck: "viewUpdateCheck",
@@ -33,23 +32,18 @@ export const permissionsToCheck = {
     },
     action: "create",
   },
-  [checks.createTemplates]: {
+  [checks.createAnyTemplate]: {
+    object: {
+      resource_type: "template",
+      any_org: true,
+    },
+    action: "update",
+  },
+  [checks.updateAllTemplates]: {
     object: {
       resource_type: "template",
     },
     action: "update",
-  },
-  [checks.updateTemplates]: {
-    object: {
-      resource_type: "template",
-    },
-    action: "update",
-  },
-  [checks.deleteTemplates]: {
-    object: {
-      resource_type: "template",
-    },
-    action: "delete",
   },
   [checks.viewAuditLog]: {
     object: {

@@ -38,7 +38,7 @@ export interface WorkspacesTableProps {
   onCheckChange: (checkedWorkspaces: readonly Workspace[]) => void;
   canCheckWorkspaces: boolean;
   templates?: Template[];
-  canCreateTemplate: boolean;
+  canCreateAnyTemplate: boolean;
 }
 
 export const WorkspacesTable: FC<WorkspacesTableProps> = ({
@@ -49,7 +49,7 @@ export const WorkspacesTable: FC<WorkspacesTableProps> = ({
   onCheckChange,
   canCheckWorkspaces,
   templates,
-  canCreateTemplate,
+  canCreateAnyTemplate,
 }) => {
   const theme = useTheme();
 
@@ -105,7 +105,7 @@ export const WorkspacesTable: FC<WorkspacesTableProps> = ({
             <WorkspacesEmpty
               templates={templates}
               isUsingFilter={isUsingFilter}
-              canCreateTemplate={canCreateTemplate}
+              canCreateAnyTemplate={canCreateAnyTemplate}
             />
           )}
           {workspaces &&
