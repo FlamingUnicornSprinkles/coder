@@ -2,7 +2,7 @@ export const checks = {
   viewAllUsers: "viewAllUsers",
   updateUsers: "updateUsers",
   createUser: "createUser",
-  viewAuditLog: "viewAuditLog",
+  viewAnyAuditLog: "viewAnyAuditLog",
   createAnyTemplate: "createAnyTemplate",
   updateAllTemplates: "updateAllTemplates",
   viewDeploymentValues: "viewDeploymentValues",
@@ -45,9 +45,10 @@ export const permissionsToCheck = {
     },
     action: "update",
   },
-  [checks.viewAuditLog]: {
+  [checks.viewAnyAuditLog]: {
     object: {
       resource_type: "audit_log",
+      any_org: true,
     },
     action: "read",
   },
