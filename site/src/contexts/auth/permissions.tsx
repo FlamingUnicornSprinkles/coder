@@ -6,7 +6,6 @@ export const checks = {
   createAnyTemplate: "createAnyTemplate",
   updateAllTemplates: "updateAllTemplates",
   viewDeploymentValues: "viewDeploymentValues",
-  createGroup: "createGroup",
   viewUpdateCheck: "viewUpdateCheck",
   viewExternalAuthConfig: "viewExternalAuthConfig",
   viewDeploymentStats: "viewDeploymentStats",
@@ -57,12 +56,6 @@ export const permissionsToCheck = {
       resource_type: "deployment_config",
     },
     action: "read",
-  },
-  [checks.createGroup]: {
-    object: {
-      resource_type: "group",
-    },
-    action: "create",
   },
   [checks.viewUpdateCheck]: {
     object: {
