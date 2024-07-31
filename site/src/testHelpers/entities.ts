@@ -2479,10 +2479,14 @@ export const MockPermissions: Permissions = {
   updateUsers: true,
   viewAnyAuditLog: true,
   viewDeploymentValues: true,
+  editDeploymentValues: true,
   viewUpdateCheck: true,
   viewDeploymentStats: true,
   viewExternalAuthConfig: true,
   editWorkspaceProxies: true,
+  createOrganization: true,
+  editAnyOrganization: true,
+  viewAnyGroup: true,
 };
 
 export const MockDeploymentConfig: DeploymentConfig = {

@@ -6,10 +6,14 @@ export const checks = {
   createAnyTemplate: "createAnyTemplate",
   updateAllTemplates: "updateAllTemplates",
   viewDeploymentValues: "viewDeploymentValues",
+  editDeploymentValues: "editDeploymentValues",
   viewUpdateCheck: "viewUpdateCheck",
   viewExternalAuthConfig: "viewExternalAuthConfig",
   viewDeploymentStats: "viewDeploymentStats",
   editWorkspaceProxies: "editWorkspaceProxies",
+  createOrganization: "createOrganization",
+  editAnyOrganization: "editAnyOrganization",
+  viewAnyGroup: "viewAnyGroup",
 } as const;
 
 export const permissionsToCheck = {
@@ -57,6 +61,12 @@ export const permissionsToCheck = {
     },
     action: "read",
   },
+  [checks.editDeploymentValues]: {
+    object: {
+      resource_type: "deployment_config",
+    },
+    action: "update",
+  },
   [checks.viewUpdateCheck]: {
     object: {
       resource_type: "deployment_config",
@@ -80,6 +90,26 @@ export const permissionsToCheck = {
       resource_type: "workspace_proxy",
     },
     action: "create",
+  },
+  [checks.createOrganization]: {
+    object: {
+      resource_type: "organization",
+    },
+    action: "create",
+  },
+  [checks.editAnyOrganization]: {
+    object: {
+      resource_type: "organization",
+      any_org: true,
+    },
+    action: "update",
+  },
+  [checks.viewAnyGroup]: {
+    object: {
+      resource_type: "group",
+      org_id: "any",
+    },
+    action: "read",
   },
 } as const;
 
