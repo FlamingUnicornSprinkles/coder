@@ -572,6 +572,24 @@ class ApiMethods {
     return response.data;
   };
 
+  patchOrganizationRole = async (
+    organizationId: string,
+    role: TypesGen.Role,
+  ): Promise<TypesGen.Role> => {
+    const response = await this.axios.patch<TypesGen.Role>(
+      `/api/v2/organizations/${organizationId}/members/roles`,
+      role,
+    );
+
+    return response.data;
+  };
+
+  deleteOrganizationRole = async (organizationId: string, roleName: string) => {
+    await this.axios.delete(
+      `/api/v2/organizations/${organizationId}/members/roles/${roleName}`,
+    );
+  };
+
   addOrganizationMember = async (organizationId: string, userId: string) => {
     const response = await this.axios.post<TypesGen.OrganizationMember>(
       `/api/v2/organizations/${organizationId}/members/${userId}`,
