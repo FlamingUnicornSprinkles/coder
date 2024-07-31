@@ -155,6 +155,9 @@ export const OrganizationSettingsNavigation: FC<
           <SidebarNavSubItem href={urlForSubpage(organization.name, "groups")}>
             Groups
           </SidebarNavSubItem>
+          <SidebarNavSubItem href={urlForSubpage(organization.name, "roles")}>
+            Roles
+          </SidebarNavSubItem>
           {/* For now redirect to the site-wide audit page with the organization
               pre-filled into the filter.  Based on user feedback we might want
               to serve a copy of the audit page or even delete this link. */}

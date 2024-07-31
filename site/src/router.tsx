@@ -242,6 +242,10 @@ const OrganizationGroupSettingsPage = lazy(
 const OrganizationMembersPage = lazy(
   () => import("./pages/ManagementSettingsPage/OrganizationMembersPage"),
 );
+const OrganizationCustomRolesPage = lazy(
+  () =>
+    import("./pages/ManagementSettingsPage/CustomRolesPage/CustomRolesPage"),
+);
 const TemplateEmbedPage = lazy(
   () => import("./pages/TemplatePage/TemplateEmbedPage/TemplateEmbedPage"),
 );
@@ -372,6 +376,7 @@ export const router = createBrowserRouter(
               <Route index element={<OrganizationSettingsPage />} />
               <Route path="members" element={<OrganizationMembersPage />} />
               {groupsRouter()}
+              <Route path="roles" element={<OrganizationCustomRolesPage />} />
               <Route path="auditing" element={<></>} />
             </Route>
           </Route>
