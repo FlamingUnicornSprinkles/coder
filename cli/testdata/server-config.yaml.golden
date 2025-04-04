@@ -7,8 +7,8 @@ networking:
   # (default: <unset>, type: string)
   wildcardAccessURL: ""
   # Specifies the custom docs URL.
-  # (default: <unset>, type: url)
-  docsURL:
+  # (default: https://coder.com/docs, type: url)
+  docsURL: https://coder.com/docs
   # Specifies whether to redirect requests that do not match the access URL host.
   # (default: <unset>, type: bool)
   redirectToAccessURL: false
@@ -16,6 +16,12 @@ networking:
     # HTTP bind address of the server. Unset to disable the HTTP endpoint.
     # (default: 127.0.0.1:3000, type: string)
     httpAddress: 127.0.0.1:3000
+    # Coder configures a Content Security Policy (CSP) to protect against XSS attacks.
+    # This setting allows you to add additional CSP directives, which can open the
+    # attack surface of the deployment. Format matches the CSP directive format, e.g.
+    # --additional-csp-policy="script-src https://example.com".
+    # (default: <unset>, type: string-array)
+    additionalCSPPolicy: []
     # The maximum lifetime duration users can specify when creating an API token.
     # (default: 876600h0m0s, type: duration)
     maxTokenLifetime: 876600h0m0s
@@ -197,7 +203,8 @@ introspection:
       - template_name
       - username
       - workspace_name
-    # Collect database metrics (may increase charges for metrics storage).
+    # Collect database query metrics (may increase charges for metrics storage). If
+    # set to false, a reduced set of database metrics are still collected.
     # (default: false, type: bool)
     collect_db_metrics: false
   pprof:
@@ -255,6 +262,12 @@ oauth2:
     # Client ID for Login with GitHub.
     # (default: <unset>, type: string)
     clientID: ""
+    # Enable device flow for Login with GitHub.
+    # (default: false, type: bool)
+    deviceFlow: false
+    # Enable the default GitHub OAuth2 provider managed by Coder.
+    # (default: true, type: bool)
+    defaultProviderEnable: true
     # Organizations the user must be a member of to Login with GitHub.
     # (default: <unset>, type: string-array)
     allowedOrgs: []
@@ -319,6 +332,25 @@ oidc:
   # Ignore the userinfo endpoint and only use the ID token for user information.
   # (default: false, type: bool)
   ignoreUserInfo: false
+  # Source supplemental user claims from the 'access_token'. This assumes the token
+  # is a jwt signed by the same issuer as the id_token. Using this requires setting
+  # 'oidc-ignore-userinfo' to true. This setting is not compliant with the OIDC
+  # specification and is not recommended. Use at your own risk.
+  # (default: false, type: bool)
+  accessTokenClaims: false
+  # This field must be set if using the organization sync feature. Set to the claim
+  # to be used for organizations.
+  # (default: <unset>, type: string)
+  organizationField: ""
+  # If set to true, users will always be added to the default organization. If
+  # organization sync is enabled, then the default org is always added to the user's
+  # set of expectedorganizations.
+  # (default: true, type: bool)
+  organizationAssignDefault: true
+  # A map of OIDC claims and the organizations in Coder it should map to. This is
+  # required because organization IDs must be used within Coder.
+  # (default: {}, type: struct[map[string][]uuid.UUID])
+  organizationMapping: {}
   # This field must be set if using the group sync feature and the scope name is not
   # 'groups'. Set to the claim to be used for groups.
   # (default: <unset>, type: string)
@@ -370,8 +402,8 @@ oidc:
   # (default: <unset>, type: bool)
   dangerousSkipIssuerChecks: false
 # Telemetry is critical to our ability to improve Coder. We strip all personal
-# information before sending data to our servers. Please only disable telemetry
-# when required by your organization's security policy.
+#  information before sending data to our servers. Please only disable telemetry
+#  when required by your organization's security policy.
 telemetry:
   # Whether telemetry is enabled or not. Coder collects anonymized usage data to
   # help improve our product.
@@ -410,17 +442,28 @@ experiments: []
 # performed once per day.
 # (default: false, type: bool)
 updateCheck: false
+# The default lifetime duration for API tokens. This value is used when creating a
+# token without specifying a duration, such as when authenticating the CLI or an
+# IDE plugin.
+# (default: 168h0m0s, type: duration)
+defaultTokenLifetime: 168h0m0s
 # Expose the swagger endpoint via /swagger.
 # (default: <unset>, type: bool)
 enableSwagger: false
 # The directory to cache temporary files. If unspecified and $CACHE_DIRECTORY is
-# set, it will be used for compatibility with systemd.
+# set, it will be used for compatibility with systemd. This directory is NOT safe
+# to be configured as a shared directory across coderd/provisionerd replicas.
 # (default: [cache dir], type: string)
 cacheDir: [cache dir]
 # Controls whether data will be stored in an in-memory database.
 # (default: <unset>, type: bool)
 inMemoryDatabase: false
-# Type of auth to use when connecting to postgres.
+# Controls whether Coder data, including built-in Postgres, will be stored in a
+# temporary directory and deleted when the server is stopped.
+# (default: <unset>, type: bool)
+ephemeralDeployment: false
+# Type of auth to use when connecting to postgres. For AWS RDS, using IAM
+# authentication (awsiamrds) is recommended.
 # (default: password, type: enum[password\|awsiamrds])
 pgAuth: password
 # A URL to an external Terms of Service that must be accepted by users when
@@ -432,8 +475,8 @@ termsOfServiceURL: ""
 # (default: ed25519, type: string)
 sshKeygenAlgorithm: ed25519
 # URL to use for agent troubleshooting when not set in the template.
-# (default: https://coder.com/docs/templates/troubleshooting, type: url)
-agentFallbackTroubleshootingURL: https://coder.com/docs/templates/troubleshooting
+# (default: https://coder.com/docs/admin/templates/troubleshooting, type: url)
+agentFallbackTroubleshootingURL: https://coder.com/docs/admin/templates/troubleshooting
 # Disable workspace apps that are not served from subdomains. Path-based apps can
 # make requests to the Coder API and pose a security risk when the workspace
 # serves malicious JavaScript. This is recommended for security purposes if a
@@ -498,6 +541,51 @@ userQuietHoursSchedule:
 # compatibility reasons, this will be removed in a future release.
 # (default: false, type: bool)
 allowWorkspaceRenames: false
+# Configure how emails are sent.
+email:
+  # The sender's address to use.
+  # (default: <unset>, type: string)
+  from: ""
+  # The intermediary SMTP host through which emails are sent.
+  # (default: <unset>, type: string)
+  smarthost: ""
+  # The hostname identifying the SMTP server.
+  # (default: localhost, type: string)
+  hello: localhost
+  # Force a TLS connection to the configured SMTP smarthost.
+  # (default: false, type: bool)
+  forceTLS: false
+  # Configure SMTP authentication options.
+  emailAuth:
+    # Identity to use with PLAIN authentication.
+    # (default: <unset>, type: string)
+    identity: ""
+    # Username to use with PLAIN/LOGIN authentication.
+    # (default: <unset>, type: string)
+    username: ""
+    # File from which to load password for use with PLAIN/LOGIN authentication.
+    # (default: <unset>, type: string)
+    passwordFile: ""
+  # Configure TLS for your SMTP server target.
+  emailTLS:
+    # Enable STARTTLS to upgrade insecure SMTP connections using TLS.
+    # (default: <unset>, type: bool)
+    startTLS: false
+    # Server name to verify against the target certificate.
+    # (default: <unset>, type: string)
+    serverName: ""
+    # Skip verification of the target server's certificate (insecure).
+    # (default: <unset>, type: bool)
+    insecureSkipVerify: false
+    # CA certificate file to use.
+    # (default: <unset>, type: string)
+    caCertFile: ""
+    # Certificate file to use.
+    # (default: <unset>, type: string)
+    certFile: ""
+    # Certificate key file to use.
+    # (default: <unset>, type: string)
+    certKeyFile: ""
 # Configure how notifications are processed and delivered.
 notifications:
   # Which delivery method to use (available options: 'smtp', 'webhook').
@@ -512,13 +600,13 @@ notifications:
     # (default: <unset>, type: string)
     from: ""
     # The intermediary SMTP host through which emails are sent.
-    # (default: localhost:587, type: host:port)
-    smarthost: localhost:587
+    # (default: <unset>, type: string)
+    smarthost: ""
     # The hostname identifying the SMTP server.
-    # (default: localhost, type: string)
+    # (default: <unset>, type: string)
     hello: localhost
     # Force a TLS connection to the configured SMTP smarthost.
-    # (default: false, type: bool)
+    # (default: <unset>, type: bool)
     forceTLS: false
     # Configure SMTP authentication options.
     emailAuth:
@@ -528,9 +616,6 @@ notifications:
       # Username to use with PLAIN/LOGIN authentication.
       # (default: <unset>, type: string)
       username: ""
-      # Password to use with PLAIN/LOGIN authentication.
-      # (default: <unset>, type: string)
-      password: ""
       # File from which to load password for use with PLAIN/LOGIN authentication.
       # (default: <unset>, type: string)
       passwordFile: ""
@@ -558,6 +643,10 @@ notifications:
     # The endpoint to which to send webhooks.
     # (default: <unset>, type: url)
     endpoint:
+  inbox:
+    # Enable Coder Inbox.
+    # (default: true, type: bool)
+    enabled: true
   # The upper limit of attempts to send a notification.
   # (default: 5, type: int)
   maxSendAttempts: 5

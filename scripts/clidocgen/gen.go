@@ -54,13 +54,21 @@ func init() {
 			"wrapCode": func(s string) string {
 				return fmt.Sprintf("<code>%s</code>", s)
 			},
-			"commandURI": func(cmd *serpent.Command) string {
-				return fmtDocFilename(cmd)
-			},
-			"fullName": fullName,
+			"commandURI": fmtDocFilename,
+			"fullName":   fullName,
 			"tableHeader": func() string {
 				return `| | |
 | --- | --- |`
+			},
+			"typeHelper": func(opt *serpent.Option) string {
+				switch v := opt.Value.(type) {
+				case *serpent.Enum:
+					return strings.Join(v.Choices, "\\|")
+				case *serpent.EnumArray:
+					return fmt.Sprintf("[%s]", strings.Join(v.Choices, "\\|"))
+				default:
+					return v.Type()
+				}
 			},
 		},
 		).Parse(strings.TrimSpace(commandTemplateRaw)),
@@ -77,7 +85,7 @@ func fullName(cmd *serpent.Command) string {
 func fmtDocFilename(cmd *serpent.Command) string {
 	if cmd.FullName() == "coder" {
 		// Special case for index.
-		return "../cli.md"
+		return "./index.md"
 	}
 	name := strings.ReplaceAll(fullName(cmd), " ", "_")
 	return fmt.Sprintf("%s.md", name)

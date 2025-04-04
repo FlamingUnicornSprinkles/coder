@@ -10,13 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/briandowns/spinner"
 	"github.com/google/uuid"
 	"golang.org/x/xerrors"
 
 	"github.com/coder/coder/v2/cli/cliui"
+	"github.com/coder/coder/v2/cli/cliutil"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/provisionersdk"
 	"github.com/coder/pretty"
@@ -52,13 +52,21 @@ func (r *RootCmd) templatePush() *serpent.Command {
 				return err
 			}
 
-			name, err := uploadFlags.templateName(inv.Args)
+			name, err := uploadFlags.templateName(inv)
 			if err != nil {
 				return err
 			}
 
-			if utf8.RuneCountInString(name) > 32 {
-				return xerrors.Errorf("Template name must be no more than 32 characters")
+			err = codersdk.NameValid(name)
+			if err != nil {
+				return xerrors.Errorf("template name %q is invalid: %w", name, err)
+			}
+
+			if versionName != "" {
+				err = codersdk.TemplateVersionNameValid(versionName)
+				if err != nil {
+					return xerrors.Errorf("template version name %q is invalid: %w", versionName, err)
+				}
 			}
 
 			var createTemplate bool
@@ -80,7 +88,7 @@ func (r *RootCmd) templatePush() *serpent.Command {
 			message := uploadFlags.templateMessage(inv)
 
 			var varsFiles []string
-			if !uploadFlags.stdin() {
+			if !uploadFlags.stdin(inv) {
 				varsFiles, err = codersdk.DiscoverVarsFiles(uploadFlags.directory)
 				if err != nil {
 					return err
@@ -129,8 +137,9 @@ func (r *RootCmd) templatePush() *serpent.Command {
 				UserVariableValues: userVariableValues,
 			}
 
+			// This ensures the version name is set in the request arguments regardless of whether you're creating a new template or updating an existing one.
+			args.Name = versionName
 			if !createTemplate {
-				args.Name = versionName
 				args.Template = &template
 				args.ReuseParameters = !alwaysPrompt
 			}
@@ -268,13 +277,19 @@ func (pf *templateUploadFlags) setWorkdir(wd string) {
 	}
 }
 
-func (pf *templateUploadFlags) stdin() bool {
-	return pf.directory == "-"
+func (pf *templateUploadFlags) stdin(inv *serpent.Invocation) (out bool) {
+	defer func() {
+		if out {
+			inv.Logger.Info(inv.Context(), "uploading tar read from stdin")
+		}
+	}()
+	// We let the directory override our isTTY check
+	return pf.directory == "-" || (!isTTYIn(inv) && pf.directory == ".")
 }
 
 func (pf *templateUploadFlags) upload(inv *serpent.Invocation, client *codersdk.Client) (*codersdk.UploadResponse, error) {
 	var content io.Reader
-	if pf.stdin() {
+	if pf.stdin(inv) {
 		content = inv.Stdin
 	} else {
 		prettyDir := prettyDirectoryPath(pf.directory)
@@ -310,7 +325,7 @@ func (pf *templateUploadFlags) upload(inv *serpent.Invocation, client *codersdk.
 }
 
 func (pf *templateUploadFlags) checkForLockfile(inv *serpent.Invocation) error {
-	if pf.stdin() || pf.ignoreLockfile {
+	if pf.stdin(inv) || pf.ignoreLockfile {
 		// Just assume there's a lockfile if reading from stdin.
 		return nil
 	}
@@ -343,8 +358,9 @@ func (pf *templateUploadFlags) templateMessage(inv *serpent.Invocation) string {
 	return "Uploaded from the CLI"
 }
 
-func (pf *templateUploadFlags) templateName(args []string) (string, error) {
-	if pf.stdin() {
+func (pf *templateUploadFlags) templateName(inv *serpent.Invocation) (string, error) {
+	args := inv.Args
+	if pf.stdin(inv) {
 		// Can't infer name from directory if none provided.
 		if len(args) == 0 {
 			return "", xerrors.New("template name argument must be provided")
@@ -401,7 +417,7 @@ func createValidTemplateVersion(inv *serpent.Invocation, args createValidTemplat
 	if err != nil {
 		return nil, err
 	}
-
+	cliutil.WarnMatchedProvisioners(inv.Stderr, version.MatchedProvisioners, version.Job)
 	err = cliui.ProvisionerJob(inv.Context(), inv.Stdout, cliui.ProvisionerJobOptions{
 		Fetch: func() (codersdk.ProvisionerJob, error) {
 			version, err := client.TemplateVersion(inv.Context(), version.ID)

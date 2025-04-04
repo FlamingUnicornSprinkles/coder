@@ -19,7 +19,7 @@ import (
 	"github.com/coder/coder/v2/coderd/provisionerdserver"
 	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/coderd/telemetry"
-	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/coderd/wspubsub"
 	"github.com/coder/coder/v2/provisionersdk"
 	sdkproto "github.com/coder/coder/v2/provisionersdk/proto"
 )
@@ -32,7 +32,7 @@ var ownerCtx = dbauthz.As(context.Background(), rbac.Subject{
 })
 
 type WorkspaceResponse struct {
-	Workspace  database.Workspace
+	Workspace  database.WorkspaceTable
 	Build      database.WorkspaceBuild
 	AgentToken string
 	TemplateVersionResponse
@@ -44,7 +44,7 @@ type WorkspaceBuildBuilder struct {
 	t          testing.TB
 	db         database.Store
 	ps         pubsub.Pubsub
-	ws         database.Workspace
+	ws         database.WorkspaceTable
 	seed       database.WorkspaceBuild
 	resources  []*sdkproto.Resource
 	params     []database.WorkspaceBuildParameter
@@ -60,7 +60,7 @@ type workspaceBuildDisposition struct {
 // Pass a database.Workspace{} with a nil ID to also generate a new workspace.
 // Omitting the template ID on a workspace will also generate a new template
 // with a template version.
-func WorkspaceBuild(t testing.TB, db database.Store, ws database.Workspace) WorkspaceBuildBuilder {
+func WorkspaceBuild(t testing.TB, db database.Store, ws database.WorkspaceTable) WorkspaceBuildBuilder {
 	return WorkspaceBuildBuilder{t: t, db: db, ws: ws}
 }
 
@@ -91,7 +91,8 @@ func (b WorkspaceBuildBuilder) WithAgent(mutations ...func([]*sdkproto.Agent) []
 	//nolint: revive // returns modified struct
 	b.agentToken = uuid.NewString()
 	agents := []*sdkproto.Agent{{
-		Id: uuid.NewString(),
+		Id:   uuid.NewString(),
+		Name: "dev",
 		Auth: &sdkproto.Agent_Token{
 			Token: b.agentToken,
 		},
@@ -194,8 +195,8 @@ func (b WorkspaceBuildBuilder) Do() WorkspaceResponse {
 					UUID:  uuid.New(),
 					Valid: true,
 				},
-				Types: []database.ProvisionerType{database.ProvisionerTypeEcho},
-				Tags:  []byte(`{"scope": "organization"}`),
+				Types:           []database.ProvisionerType{database.ProvisionerTypeEcho},
+				ProvisionerTags: []byte(`{"scope": "organization"}`),
 			})
 			require.NoError(b.t, err, "acquire starting job")
 			if j.ID == job.ID {
@@ -224,8 +225,21 @@ func (b WorkspaceBuildBuilder) Do() WorkspaceResponse {
 	}
 	_ = dbgen.WorkspaceBuildParameters(b.t, b.db, b.params)
 
+	if b.ws.Deleted {
+		err = b.db.UpdateWorkspaceDeletedByID(ownerCtx, database.UpdateWorkspaceDeletedByIDParams{
+			ID:      b.ws.ID,
+			Deleted: true,
+		})
+		require.NoError(b.t, err)
+	}
+
 	if b.ps != nil {
-		err = b.ps.Publish(codersdk.WorkspaceNotifyChannel(resp.Build.WorkspaceID), []byte{})
+		msg, err := json.Marshal(wspubsub.WorkspaceEvent{
+			Kind:        wspubsub.WorkspaceEventKindStateChange,
+			WorkspaceID: resp.Workspace.ID,
+		})
+		require.NoError(b.t, err)
+		err = b.ps.Publish(wspubsub.WorkspaceEventChannel(resp.Workspace.OwnerID), msg)
 		require.NoError(b.t, err)
 	}
 

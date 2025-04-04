@@ -5,18 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"golang.org/x/exp/slices"
 	"golang.org/x/xerrors"
 	"tailscale.com/tailcfg"
 
+	agentproto "github.com/coder/coder/v2/agent/proto"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/rbac/policy"
 	"github.com/coder/coder/v2/coderd/render"
 	"github.com/coder/coder/v2/coderd/workspaceapps/appurl"
 	"github.com/coder/coder/v2/codersdk"
@@ -148,15 +150,42 @@ func ReducedUser(user database.User) codersdk.ReducedUser {
 			Username:  user.Username,
 			AvatarURL: user.AvatarURL,
 		},
-		Email:           user.Email,
-		Name:            user.Name,
-		CreatedAt:       user.CreatedAt,
-		UpdatedAt:       user.UpdatedAt,
-		LastSeenAt:      user.LastSeenAt,
-		Status:          codersdk.UserStatus(user.Status),
-		LoginType:       codersdk.LoginType(user.LoginType),
-		ThemePreference: user.ThemePreference,
+		Email:      user.Email,
+		Name:       user.Name,
+		CreatedAt:  user.CreatedAt,
+		UpdatedAt:  user.UpdatedAt,
+		LastSeenAt: user.LastSeenAt,
+		Status:     codersdk.UserStatus(user.Status),
+		LoginType:  codersdk.LoginType(user.LoginType),
 	}
+}
+
+func UserFromGroupMember(member database.GroupMember) database.User {
+	return database.User{
+		ID:                 member.UserID,
+		Email:              member.UserEmail,
+		Username:           member.UserUsername,
+		HashedPassword:     member.UserHashedPassword,
+		CreatedAt:          member.UserCreatedAt,
+		UpdatedAt:          member.UserUpdatedAt,
+		Status:             member.UserStatus,
+		RBACRoles:          member.UserRbacRoles,
+		LoginType:          member.UserLoginType,
+		AvatarURL:          member.UserAvatarUrl,
+		Deleted:            member.UserDeleted,
+		LastSeenAt:         member.UserLastSeenAt,
+		QuietHoursSchedule: member.UserQuietHoursSchedule,
+		Name:               member.UserName,
+		GithubComUserID:    member.UserGithubComUserID,
+	}
+}
+
+func ReducedUserFromGroupMember(member database.GroupMember) codersdk.ReducedUser {
+	return ReducedUser(UserFromGroupMember(member))
+}
+
+func ReducedUsersFromGroupMembers(members []database.GroupMember) []codersdk.ReducedUser {
+	return List(members, ReducedUserFromGroupMember)
 }
 
 func ReducedUsers(users []database.User) []codersdk.ReducedUser {
@@ -179,16 +208,19 @@ func Users(users []database.User, organizationIDs map[uuid.UUID][]uuid.UUID) []c
 	})
 }
 
-func Group(group database.Group, members []database.User) codersdk.Group {
+func Group(row database.GetGroupsRow, members []database.GroupMember, totalMemberCount int) codersdk.Group {
 	return codersdk.Group{
-		ID:             group.ID,
-		Name:           group.Name,
-		DisplayName:    group.DisplayName,
-		OrganizationID: group.OrganizationID,
-		AvatarURL:      group.AvatarURL,
-		Members:        ReducedUsers(members),
-		QuotaAllowance: int(group.QuotaAllowance),
-		Source:         codersdk.GroupSource(group.Source),
+		ID:                      row.Group.ID,
+		Name:                    row.Group.Name,
+		DisplayName:             row.Group.DisplayName,
+		OrganizationID:          row.Group.OrganizationID,
+		AvatarURL:               row.Group.AvatarURL,
+		Members:                 ReducedUsersFromGroupMembers(members),
+		TotalMemberCount:        totalMemberCount,
+		QuotaAllowance:          int(row.Group.QuotaAllowance),
+		Source:                  codersdk.GroupSource(row.Group.Source),
+		OrganizationName:        row.OrganizationName,
+		OrganizationDisplayName: row.OrganizationDisplayName,
 	}
 }
 
@@ -455,7 +487,7 @@ func AppSubdomain(dbApp database.WorkspaceApp, agentName, workspaceName, ownerNa
 	}.String()
 }
 
-func Apps(dbApps []database.WorkspaceApp, agent database.WorkspaceAgent, ownerName string, workspace database.Workspace) []codersdk.WorkspaceApp {
+func Apps(dbApps []database.WorkspaceApp, statuses []database.WorkspaceAppStatus, agent database.WorkspaceAgent, ownerName string, workspace database.Workspace) []codersdk.WorkspaceApp {
 	sort.Slice(dbApps, func(i, j int) bool {
 		if dbApps[i].DisplayOrder != dbApps[j].DisplayOrder {
 			return dbApps[i].DisplayOrder < dbApps[j].DisplayOrder
@@ -466,8 +498,14 @@ func Apps(dbApps []database.WorkspaceApp, agent database.WorkspaceAgent, ownerNa
 		return dbApps[i].Slug < dbApps[j].Slug
 	})
 
+	statusesByAppID := map[uuid.UUID][]database.WorkspaceAppStatus{}
+	for _, status := range statuses {
+		statusesByAppID[status.AppID] = append(statusesByAppID[status.AppID], status)
+	}
+
 	apps := make([]codersdk.WorkspaceApp, 0)
 	for _, dbApp := range dbApps {
+		statuses := statusesByAppID[dbApp.ID]
 		apps = append(apps, codersdk.WorkspaceApp{
 			ID:            dbApp.ID,
 			URL:           dbApp.Url.String,
@@ -484,10 +522,32 @@ func Apps(dbApps []database.WorkspaceApp, agent database.WorkspaceAgent, ownerNa
 				Interval:  dbApp.HealthcheckInterval,
 				Threshold: dbApp.HealthcheckThreshold,
 			},
-			Health: codersdk.WorkspaceAppHealth(dbApp.Health),
+			Health:   codersdk.WorkspaceAppHealth(dbApp.Health),
+			Hidden:   dbApp.Hidden,
+			OpenIn:   codersdk.WorkspaceAppOpenIn(dbApp.OpenIn),
+			Statuses: WorkspaceAppStatuses(statuses),
 		})
 	}
 	return apps
+}
+
+func WorkspaceAppStatuses(statuses []database.WorkspaceAppStatus) []codersdk.WorkspaceAppStatus {
+	return List(statuses, WorkspaceAppStatus)
+}
+
+func WorkspaceAppStatus(status database.WorkspaceAppStatus) codersdk.WorkspaceAppStatus {
+	return codersdk.WorkspaceAppStatus{
+		ID:                 status.ID,
+		CreatedAt:          status.CreatedAt,
+		WorkspaceID:        status.WorkspaceID,
+		AgentID:            status.AgentID,
+		AppID:              status.AppID,
+		NeedsUserAttention: status.NeedsUserAttention,
+		URI:                status.Uri.String,
+		Icon:               status.Icon.String,
+		Message:            status.Message,
+		State:              codersdk.WorkspaceAppStatusState(status.State),
+	}
 }
 
 func ProvisionerDaemon(dbDaemon database.ProvisionerDaemon) codersdk.ProvisionerDaemon {
@@ -500,11 +560,36 @@ func ProvisionerDaemon(dbDaemon database.ProvisionerDaemon) codersdk.Provisioner
 		Tags:           dbDaemon.Tags,
 		Version:        dbDaemon.Version,
 		APIVersion:     dbDaemon.APIVersion,
+		KeyID:          dbDaemon.KeyID,
 	}
 	for _, provisionerType := range dbDaemon.Provisioners {
 		result.Provisioners = append(result.Provisioners, codersdk.ProvisionerType(provisionerType))
 	}
 	return result
+}
+
+func RecentProvisionerDaemons(now time.Time, staleInterval time.Duration, daemons []database.ProvisionerDaemon) []codersdk.ProvisionerDaemon {
+	results := []codersdk.ProvisionerDaemon{}
+
+	for _, daemon := range daemons {
+		// Daemon never connected, skip.
+		if !daemon.LastSeenAt.Valid {
+			continue
+		}
+		// Daemon has gone away, skip.
+		if now.Sub(daemon.LastSeenAt.Time) > staleInterval {
+			continue
+		}
+
+		results = append(results, ProvisionerDaemon(daemon))
+	}
+
+	// Ensure stable order for display and for tests
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Name < results[j].Name
+	})
+
+	return results
 }
 
 func SlimRole(role rbac.Role) codersdk.SlimRole {
@@ -599,5 +684,72 @@ func Organization(organization database.Organization) codersdk.Organization {
 		CreatedAt:   organization.CreatedAt,
 		UpdatedAt:   organization.UpdatedAt,
 		IsDefault:   organization.IsDefault,
+	}
+}
+
+func CryptoKeys(keys []database.CryptoKey) []codersdk.CryptoKey {
+	return List(keys, CryptoKey)
+}
+
+func CryptoKey(key database.CryptoKey) codersdk.CryptoKey {
+	return codersdk.CryptoKey{
+		Feature:   codersdk.CryptoKeyFeature(key.Feature),
+		Sequence:  key.Sequence,
+		StartsAt:  key.StartsAt,
+		DeletesAt: key.DeletesAt.Time,
+		Secret:    key.Secret.String,
+	}
+}
+
+func MatchedProvisioners(provisionerDaemons []database.ProvisionerDaemon, now time.Time, staleInterval time.Duration) codersdk.MatchedProvisioners {
+	minLastSeenAt := now.Add(-staleInterval)
+	mostRecentlySeen := codersdk.NullTime{}
+	var matched codersdk.MatchedProvisioners
+	for _, provisioner := range provisionerDaemons {
+		if !provisioner.LastSeenAt.Valid {
+			continue
+		}
+		matched.Count++
+		if provisioner.LastSeenAt.Time.After(minLastSeenAt) {
+			matched.Available++
+		}
+		if provisioner.LastSeenAt.Time.After(mostRecentlySeen.Time) {
+			matched.MostRecentlySeen.Valid = true
+			matched.MostRecentlySeen.Time = provisioner.LastSeenAt.Time
+		}
+	}
+	return matched
+}
+
+func TemplateRoleActions(role codersdk.TemplateRole) []policy.Action {
+	switch role {
+	case codersdk.TemplateRoleAdmin:
+		return []policy.Action{policy.WildcardSymbol}
+	case codersdk.TemplateRoleUse:
+		return []policy.Action{policy.ActionRead, policy.ActionUse}
+	}
+	return []policy.Action{}
+}
+
+func AuditActionFromAgentProtoConnectionAction(action agentproto.Connection_Action) (database.AuditAction, error) {
+	switch action {
+	case agentproto.Connection_CONNECT:
+		return database.AuditActionConnect, nil
+	case agentproto.Connection_DISCONNECT:
+		return database.AuditActionDisconnect, nil
+	default:
+		// Also Connection_ACTION_UNSPECIFIED, no mapping.
+		return "", xerrors.Errorf("unknown agent connection action %q", action)
+	}
+}
+
+func AgentProtoConnectionActionToAuditAction(action database.AuditAction) (agentproto.Connection_Action, error) {
+	switch action {
+	case database.AuditActionConnect:
+		return agentproto.Connection_CONNECT, nil
+	case database.AuditActionDisconnect:
+		return agentproto.Connection_DISCONNECT, nil
+	default:
+		return agentproto.Connection_ACTION_UNSPECIFIED, xerrors.Errorf("unknown agent connection action %q", action)
 	}
 }

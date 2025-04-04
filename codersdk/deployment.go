@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/mod/semver"
 	"golang.org/x/xerrors"
 
@@ -34,6 +35,12 @@ const (
 	EntitlementGracePeriod Entitlement = "grace_period"
 	EntitlementNotEntitled Entitlement = "not_entitled"
 )
+
+// Entitled returns if the entitlement can be used. So this is true if it
+// is entitled or still in it's grace period.
+func (e Entitlement) Entitled() bool {
+	return e == EntitlementEntitled || e == EntitlementGracePeriod
+}
 
 // Weight converts the enum types to a numerical value for easier
 // comparisons. Easier than sets of if statements.
@@ -128,6 +135,17 @@ func (n FeatureName) AlwaysEnable() bool {
 	}[n]
 }
 
+// Enterprise returns true if the feature is an enterprise feature.
+func (n FeatureName) Enterprise() bool {
+	switch n {
+	// Add all features that should be excluded in the Enterprise feature set.
+	case FeatureMultipleOrganizations, FeatureCustomRoles:
+		return false
+	default:
+		return true
+	}
+}
+
 // FeatureSet represents a grouping of features. Rather than manually
 // assigning features al-la-carte when making a license, a set can be specified.
 // Sets are dynamic in the sense a feature can be added to a set, granting the
@@ -152,13 +170,7 @@ func (set FeatureSet) Features() []FeatureName {
 		copy(enterpriseFeatures, FeatureNames)
 		// Remove the selection
 		enterpriseFeatures = slices.DeleteFunc(enterpriseFeatures, func(f FeatureName) bool {
-			switch f {
-			// Add all features that should be excluded in the Enterprise feature set.
-			case FeatureMultipleOrganizations:
-				return true
-			default:
-				return false
-			}
+			return !f.Enterprise()
 		})
 
 		return enterpriseFeatures
@@ -338,6 +350,7 @@ type DeploymentValues struct {
 	ProxyTrustedOrigins             serpent.StringArray                  `json:"proxy_trusted_origins,omitempty" typescript:",notnull"`
 	CacheDir                        serpent.String                       `json:"cache_directory,omitempty" typescript:",notnull"`
 	InMemoryDatabase                serpent.Bool                         `json:"in_memory_database,omitempty" typescript:",notnull"`
+	EphemeralDeployment             serpent.Bool                         `json:"ephemeral_deployment,omitempty" typescript:",notnull"`
 	PostgresURL                     serpent.String                       `json:"pg_connection_url,omitempty" typescript:",notnull"`
 	PostgresAuth                    string                               `json:"pg_auth,omitempty" typescript:",notnull"`
 	OAuth2                          OAuth2Config                         `json:"oauth2,omitempty" typescript:",notnull"`
@@ -379,11 +392,12 @@ type DeploymentValues struct {
 	CLIUpgradeMessage               serpent.String                       `json:"cli_upgrade_message,omitempty" typescript:",notnull"`
 	TermsOfServiceURL               serpent.String                       `json:"terms_of_service_url,omitempty" typescript:",notnull"`
 	Notifications                   NotificationsConfig                  `json:"notifications,omitempty" typescript:",notnull"`
+	AdditionalCSPPolicy             serpent.StringArray                  `json:"additional_csp_policy,omitempty" typescript:",notnull"`
 
 	Config      serpent.YAMLConfigPath `json:"config,omitempty" typescript:",notnull"`
 	WriteConfig serpent.Bool           `json:"write_config,omitempty" typescript:",notnull"`
 
-	// DEPRECATED: Use HTTPAddress or TLS.Address instead.
+	// Deprecated: Use HTTPAddress or TLS.Address instead.
 	Address serpent.HostPort `json:"address,omitempty" typescript:",notnull"`
 }
 
@@ -442,8 +456,10 @@ type SessionLifetime struct {
 	// creation is the lifetime of the api key.
 	DisableExpiryRefresh serpent.Bool `json:"disable_expiry_refresh,omitempty" typescript:",notnull"`
 
-	// DefaultDuration is for api keys, not tokens.
+	// DefaultDuration is only for browser, workspace app and oauth sessions.
 	DefaultDuration serpent.Duration `json:"default_duration" typescript:",notnull"`
+
+	DefaultTokenDuration serpent.Duration `json:"default_token_lifetime,omitempty" typescript:",notnull"`
 
 	MaximumTokenDuration serpent.Duration `json:"max_token_lifetime,omitempty" typescript:",notnull"`
 }
@@ -487,13 +503,15 @@ type OAuth2Config struct {
 }
 
 type OAuth2GithubConfig struct {
-	ClientID          serpent.String      `json:"client_id" typescript:",notnull"`
-	ClientSecret      serpent.String      `json:"client_secret" typescript:",notnull"`
-	AllowedOrgs       serpent.StringArray `json:"allowed_orgs" typescript:",notnull"`
-	AllowedTeams      serpent.StringArray `json:"allowed_teams" typescript:",notnull"`
-	AllowSignups      serpent.Bool        `json:"allow_signups" typescript:",notnull"`
-	AllowEveryone     serpent.Bool        `json:"allow_everyone" typescript:",notnull"`
-	EnterpriseBaseURL serpent.String      `json:"enterprise_base_url" typescript:",notnull"`
+	ClientID              serpent.String      `json:"client_id" typescript:",notnull"`
+	ClientSecret          serpent.String      `json:"client_secret" typescript:",notnull"`
+	DeviceFlow            serpent.Bool        `json:"device_flow" typescript:",notnull"`
+	DefaultProviderEnable serpent.Bool        `json:"default_provider_enable" typescript:",notnull"`
+	AllowedOrgs           serpent.StringArray `json:"allowed_orgs" typescript:",notnull"`
+	AllowedTeams          serpent.StringArray `json:"allowed_teams" typescript:",notnull"`
+	AllowSignups          serpent.Bool        `json:"allow_signups" typescript:",notnull"`
+	AllowEveryone         serpent.Bool        `json:"allow_everyone" typescript:",notnull"`
+	EnterpriseBaseURL     serpent.String      `json:"enterprise_base_url" typescript:",notnull"`
 }
 
 type OIDCConfig struct {
@@ -501,29 +519,42 @@ type OIDCConfig struct {
 	ClientID     serpent.String `json:"client_id" typescript:",notnull"`
 	ClientSecret serpent.String `json:"client_secret" typescript:",notnull"`
 	// ClientKeyFile & ClientCertFile are used in place of ClientSecret for PKI auth.
-	ClientKeyFile       serpent.String                      `json:"client_key_file" typescript:",notnull"`
-	ClientCertFile      serpent.String                      `json:"client_cert_file" typescript:",notnull"`
-	EmailDomain         serpent.StringArray                 `json:"email_domain" typescript:",notnull"`
-	IssuerURL           serpent.String                      `json:"issuer_url" typescript:",notnull"`
-	Scopes              serpent.StringArray                 `json:"scopes" typescript:",notnull"`
-	IgnoreEmailVerified serpent.Bool                        `json:"ignore_email_verified" typescript:",notnull"`
-	UsernameField       serpent.String                      `json:"username_field" typescript:",notnull"`
-	NameField           serpent.String                      `json:"name_field" typescript:",notnull"`
-	EmailField          serpent.String                      `json:"email_field" typescript:",notnull"`
-	AuthURLParams       serpent.Struct[map[string]string]   `json:"auth_url_params" typescript:",notnull"`
-	IgnoreUserInfo      serpent.Bool                        `json:"ignore_user_info" typescript:",notnull"`
-	GroupAutoCreate     serpent.Bool                        `json:"group_auto_create" typescript:",notnull"`
-	GroupRegexFilter    serpent.Regexp                      `json:"group_regex_filter" typescript:",notnull"`
-	GroupAllowList      serpent.StringArray                 `json:"group_allow_list" typescript:",notnull"`
-	GroupField          serpent.String                      `json:"groups_field" typescript:",notnull"`
-	GroupMapping        serpent.Struct[map[string]string]   `json:"group_mapping" typescript:",notnull"`
-	UserRoleField       serpent.String                      `json:"user_role_field" typescript:",notnull"`
-	UserRoleMapping     serpent.Struct[map[string][]string] `json:"user_role_mapping" typescript:",notnull"`
-	UserRolesDefault    serpent.StringArray                 `json:"user_roles_default" typescript:",notnull"`
-	SignInText          serpent.String                      `json:"sign_in_text" typescript:",notnull"`
-	IconURL             serpent.URL                         `json:"icon_url" typescript:",notnull"`
-	SignupsDisabledText serpent.String                      `json:"signups_disabled_text" typescript:",notnull"`
-	SkipIssuerChecks    serpent.Bool                        `json:"skip_issuer_checks" typescript:",notnull"`
+	ClientKeyFile       serpent.String                    `json:"client_key_file" typescript:",notnull"`
+	ClientCertFile      serpent.String                    `json:"client_cert_file" typescript:",notnull"`
+	EmailDomain         serpent.StringArray               `json:"email_domain" typescript:",notnull"`
+	IssuerURL           serpent.String                    `json:"issuer_url" typescript:",notnull"`
+	Scopes              serpent.StringArray               `json:"scopes" typescript:",notnull"`
+	IgnoreEmailVerified serpent.Bool                      `json:"ignore_email_verified" typescript:",notnull"`
+	UsernameField       serpent.String                    `json:"username_field" typescript:",notnull"`
+	NameField           serpent.String                    `json:"name_field" typescript:",notnull"`
+	EmailField          serpent.String                    `json:"email_field" typescript:",notnull"`
+	AuthURLParams       serpent.Struct[map[string]string] `json:"auth_url_params" typescript:",notnull"`
+	// IgnoreUserInfo & UserInfoFromAccessToken are mutually exclusive. Only 1
+	// can be set to true. Ideally this would be an enum with 3 states, ['none',
+	// 'userinfo', 'access_token']. However, for backward compatibility,
+	// `ignore_user_info` must remain. And `access_token` is a niche, non-spec
+	// compliant edge case. So it's use is rare, and should not be advised.
+	IgnoreUserInfo serpent.Bool `json:"ignore_user_info" typescript:",notnull"`
+	// UserInfoFromAccessToken as mentioned above is an edge case. This allows
+	// sourcing the user_info from the access token itself instead of a user_info
+	// endpoint. This assumes the access token is a valid JWT with a set of claims to
+	// be merged with the id_token.
+	UserInfoFromAccessToken   serpent.Bool                           `json:"source_user_info_from_access_token" typescript:",notnull"`
+	OrganizationField         serpent.String                         `json:"organization_field" typescript:",notnull"`
+	OrganizationMapping       serpent.Struct[map[string][]uuid.UUID] `json:"organization_mapping" typescript:",notnull"`
+	OrganizationAssignDefault serpent.Bool                           `json:"organization_assign_default" typescript:",notnull"`
+	GroupAutoCreate           serpent.Bool                           `json:"group_auto_create" typescript:",notnull"`
+	GroupRegexFilter          serpent.Regexp                         `json:"group_regex_filter" typescript:",notnull"`
+	GroupAllowList            serpent.StringArray                    `json:"group_allow_list" typescript:",notnull"`
+	GroupField                serpent.String                         `json:"groups_field" typescript:",notnull"`
+	GroupMapping              serpent.Struct[map[string]string]      `json:"group_mapping" typescript:",notnull"`
+	UserRoleField             serpent.String                         `json:"user_role_field" typescript:",notnull"`
+	UserRoleMapping           serpent.Struct[map[string][]string]    `json:"user_role_mapping" typescript:",notnull"`
+	UserRolesDefault          serpent.StringArray                    `json:"user_roles_default" typescript:",notnull"`
+	SignInText                serpent.String                         `json:"sign_in_text" typescript:",notnull"`
+	IconURL                   serpent.URL                            `json:"icon_url" typescript:",notnull"`
+	SignupsDisabledText       serpent.String                         `json:"signups_disabled_text" typescript:",notnull"`
+	SkipIssuerChecks          serpent.Bool                           `json:"skip_issuer_checks" typescript:",notnull"`
 }
 
 type TelemetryConfig struct {
@@ -667,13 +698,24 @@ type NotificationsConfig struct {
 	SMTP NotificationsEmailConfig `json:"email" typescript:",notnull"`
 	// Webhook settings.
 	Webhook NotificationsWebhookConfig `json:"webhook" typescript:",notnull"`
+	// Inbox settings.
+	Inbox NotificationsInboxConfig `json:"inbox" typescript:",notnull"`
+}
+
+// Are either of the notification methods enabled?
+func (n *NotificationsConfig) Enabled() bool {
+	return n.SMTP.Smarthost != "" || n.Webhook.Endpoint != serpent.URL{}
+}
+
+type NotificationsInboxConfig struct {
+	Enabled serpent.Bool `json:"enabled" typescript:",notnull"`
 }
 
 type NotificationsEmailConfig struct {
 	// The sender's address.
 	From serpent.String `json:"from" typescript:",notnull"`
 	// The intermediary SMTP host through which emails are sent (host:port).
-	Smarthost serpent.HostPort `json:"smarthost" typescript:",notnull"`
+	Smarthost serpent.String `json:"smarthost" typescript:",notnull"`
 	// The hostname identifying the SMTP server.
 	Hello serpent.String `json:"hello" typescript:",notnull"`
 
@@ -759,6 +801,46 @@ func DefaultCacheDir() string {
 	return filepath.Join(defaultCacheDir, "coder")
 }
 
+func DefaultSupportLinks(docsURL string) []LinkConfig {
+	version := buildinfo.Version()
+	buildInfo := fmt.Sprintf("Version: [`%s`](%s)", version, buildinfo.ExternalURL())
+
+	return []LinkConfig{
+		{
+			Name:   "Documentation",
+			Target: docsURL,
+			Icon:   "docs",
+		},
+		{
+			Name:   "Report a bug",
+			Target: "https://github.com/coder/coder/issues/new?labels=needs+triage&body=" + buildInfo,
+			Icon:   "bug",
+		},
+		{
+			Name:   "Join the Coder Discord",
+			Target: "https://coder.com/chat?utm_source=coder&utm_medium=coder&utm_campaign=server-footer",
+			Icon:   "chat",
+		},
+		{
+			Name:   "Star the Repo",
+			Target: "https://github.com/coder/coder",
+			Icon:   "star",
+		},
+	}
+}
+
+func removeTrailingVersionInfo(v string) string {
+	return strings.Split(strings.Split(v, "-")[0], "+")[0]
+}
+
+func DefaultDocsURL() string {
+	version := removeTrailingVersionInfo(buildinfo.Version())
+	if version == "v0.0.0" {
+		return "https://coder.com/docs"
+	}
+	return "https://coder.com/docs/@" + version
+}
+
 // DeploymentConfig contains both the deployment values and how they're set.
 type DeploymentConfig struct {
 	Values  *DeploymentValues `json:"config,omitempty"`
@@ -842,8 +924,8 @@ func (c *DeploymentValues) Options() serpent.OptionSet {
 			Name: "Telemetry",
 			YAML: "telemetry",
 			Description: `Telemetry is critical to our ability to improve Coder. We strip all personal
-information before sending data to our servers. Please only disable telemetry
-when required by your organization's security policy.`,
+ information before sending data to our servers. Please only disable telemetry
+ when required by your organization's security policy.`,
 		}
 		deploymentGroupProvisioning = serpent.Group{
 			Name:        "Provisioning",
@@ -868,6 +950,23 @@ when required by your organization's security policy.`,
 		deploymentGroupConfig = serpent.Group{
 			Name:        "Config",
 			Description: `Use a YAML configuration file when your server launch become unwieldy.`,
+		}
+		deploymentGroupEmail = serpent.Group{
+			Name:        "Email",
+			Description: "Configure how emails are sent.",
+			YAML:        "email",
+		}
+		deploymentGroupEmailAuth = serpent.Group{
+			Name:        "Email Authentication",
+			Parent:      &deploymentGroupEmail,
+			Description: "Configure SMTP authentication options.",
+			YAML:        "emailAuth",
+		}
+		deploymentGroupEmailTLS = serpent.Group{
+			Name:        "Email TLS",
+			Parent:      &deploymentGroupEmail,
+			Description: "Configure TLS for your SMTP server target.",
+			YAML:        "emailTLS",
 		}
 		deploymentGroupNotifications = serpent.Group{
 			Name:        "Notifications",
@@ -896,6 +995,11 @@ when required by your organization's security policy.`,
 			Name:   "Webhook",
 			Parent: &deploymentGroupNotifications,
 			YAML:   "webhook",
+		}
+		deploymentGroupInbox = serpent.Group{
+			Name:   "Inbox",
+			Parent: &deploymentGroupNotifications,
+			YAML:   "inbox",
 		}
 	)
 
@@ -940,6 +1044,144 @@ when required by your organization's security policy.`,
 		Group:         &deploymentGroupIntrospectionLogging,
 		YAML:          "filter",
 	}
+	emailFrom := serpent.Option{
+		Name:        "Email: From Address",
+		Description: "The sender's address to use.",
+		Flag:        "email-from",
+		Env:         "CODER_EMAIL_FROM",
+		Value:       &c.Notifications.SMTP.From,
+		Group:       &deploymentGroupEmail,
+		YAML:        "from",
+	}
+	emailSmarthost := serpent.Option{
+		Name:        "Email: Smarthost",
+		Description: "The intermediary SMTP host through which emails are sent.",
+		Flag:        "email-smarthost",
+		Env:         "CODER_EMAIL_SMARTHOST",
+		Value:       &c.Notifications.SMTP.Smarthost,
+		Group:       &deploymentGroupEmail,
+		YAML:        "smarthost",
+	}
+	emailHello := serpent.Option{
+		Name:        "Email: Hello",
+		Description: "The hostname identifying the SMTP server.",
+		Flag:        "email-hello",
+		Env:         "CODER_EMAIL_HELLO",
+		Default:     "localhost",
+		Value:       &c.Notifications.SMTP.Hello,
+		Group:       &deploymentGroupEmail,
+		YAML:        "hello",
+	}
+	emailForceTLS := serpent.Option{
+		Name:        "Email: Force TLS",
+		Description: "Force a TLS connection to the configured SMTP smarthost.",
+		Flag:        "email-force-tls",
+		Env:         "CODER_EMAIL_FORCE_TLS",
+		Default:     "false",
+		Value:       &c.Notifications.SMTP.ForceTLS,
+		Group:       &deploymentGroupEmail,
+		YAML:        "forceTLS",
+	}
+	emailAuthIdentity := serpent.Option{
+		Name:        "Email Auth: Identity",
+		Description: "Identity to use with PLAIN authentication.",
+		Flag:        "email-auth-identity",
+		Env:         "CODER_EMAIL_AUTH_IDENTITY",
+		Value:       &c.Notifications.SMTP.Auth.Identity,
+		Group:       &deploymentGroupEmailAuth,
+		YAML:        "identity",
+	}
+	emailAuthUsername := serpent.Option{
+		Name:        "Email Auth: Username",
+		Description: "Username to use with PLAIN/LOGIN authentication.",
+		Flag:        "email-auth-username",
+		Env:         "CODER_EMAIL_AUTH_USERNAME",
+		Value:       &c.Notifications.SMTP.Auth.Username,
+		Group:       &deploymentGroupEmailAuth,
+		YAML:        "username",
+	}
+	emailAuthPassword := serpent.Option{
+		Name:        "Email Auth: Password",
+		Description: "Password to use with PLAIN/LOGIN authentication.",
+		Flag:        "email-auth-password",
+		Env:         "CODER_EMAIL_AUTH_PASSWORD",
+		Annotations: serpent.Annotations{}.Mark(annotationSecretKey, "true"),
+		Value:       &c.Notifications.SMTP.Auth.Password,
+		Group:       &deploymentGroupEmailAuth,
+	}
+	emailAuthPasswordFile := serpent.Option{
+		Name:        "Email Auth: Password File",
+		Description: "File from which to load password for use with PLAIN/LOGIN authentication.",
+		Flag:        "email-auth-password-file",
+		Env:         "CODER_EMAIL_AUTH_PASSWORD_FILE",
+		Value:       &c.Notifications.SMTP.Auth.PasswordFile,
+		Group:       &deploymentGroupEmailAuth,
+		YAML:        "passwordFile",
+	}
+	emailTLSStartTLS := serpent.Option{
+		Name:        "Email TLS: StartTLS",
+		Description: "Enable STARTTLS to upgrade insecure SMTP connections using TLS.",
+		Flag:        "email-tls-starttls",
+		Env:         "CODER_EMAIL_TLS_STARTTLS",
+		Value:       &c.Notifications.SMTP.TLS.StartTLS,
+		Group:       &deploymentGroupEmailTLS,
+		YAML:        "startTLS",
+	}
+	emailTLSServerName := serpent.Option{
+		Name:        "Email TLS: Server Name",
+		Description: "Server name to verify against the target certificate.",
+		Flag:        "email-tls-server-name",
+		Env:         "CODER_EMAIL_TLS_SERVERNAME",
+		Value:       &c.Notifications.SMTP.TLS.ServerName,
+		Group:       &deploymentGroupEmailTLS,
+		YAML:        "serverName",
+	}
+	emailTLSSkipCertVerify := serpent.Option{
+		Name:        "Email TLS: Skip Certificate Verification (Insecure)",
+		Description: "Skip verification of the target server's certificate (insecure).",
+		Flag:        "email-tls-skip-verify",
+		Env:         "CODER_EMAIL_TLS_SKIPVERIFY",
+		Value:       &c.Notifications.SMTP.TLS.InsecureSkipVerify,
+		Group:       &deploymentGroupEmailTLS,
+		YAML:        "insecureSkipVerify",
+	}
+	emailTLSCertAuthorityFile := serpent.Option{
+		Name:        "Email TLS: Certificate Authority File",
+		Description: "CA certificate file to use.",
+		Flag:        "email-tls-ca-cert-file",
+		Env:         "CODER_EMAIL_TLS_CACERTFILE",
+		Value:       &c.Notifications.SMTP.TLS.CAFile,
+		Group:       &deploymentGroupEmailTLS,
+		YAML:        "caCertFile",
+	}
+	emailTLSCertFile := serpent.Option{
+		Name:        "Email TLS: Certificate File",
+		Description: "Certificate file to use.",
+		Flag:        "email-tls-cert-file",
+		Env:         "CODER_EMAIL_TLS_CERTFILE",
+		Value:       &c.Notifications.SMTP.TLS.CertFile,
+		Group:       &deploymentGroupEmailTLS,
+		YAML:        "certFile",
+	}
+	emailTLSCertKeyFile := serpent.Option{
+		Name:        "Email TLS: Certificate Key File",
+		Description: "Certificate key file to use.",
+		Flag:        "email-tls-cert-key-file",
+		Env:         "CODER_EMAIL_TLS_CERTKEYFILE",
+		Value:       &c.Notifications.SMTP.TLS.KeyFile,
+		Group:       &deploymentGroupEmailTLS,
+		YAML:        "certKeyFile",
+	}
+	telemetryEnable := serpent.Option{
+		Name:        "Telemetry Enable",
+		Description: "Whether telemetry is enabled or not. Coder collects anonymized usage data to help improve our product.",
+		Flag:        "telemetry",
+		Env:         "CODER_TELEMETRY_ENABLE",
+		Default:     strconv.FormatBool(flag.Lookup("test.v") == nil || os.Getenv("CODER_TEST_TELEMETRY_DEFAULT_ENABLE") == "true"),
+		Value:       &c.Telemetry.Enable,
+		Group:       &deploymentGroupTelemetry,
+		YAML:        "enable",
+	}
 	opts := serpent.OptionSet{
 		{
 			Name:        "Access URL",
@@ -977,6 +1219,7 @@ when required by your organization's security policy.`,
 			Name:        "Docs URL",
 			Description: "Specifies the custom docs URL.",
 			Value:       &c.DocsURL,
+			Default:     DefaultDocsURL(),
 			Flag:        "docs-url",
 			Env:         "CODER_DOCS_URL",
 			Group:       &deploymentGroupNetworking,
@@ -1299,14 +1542,18 @@ when required by your organization's security policy.`,
 			Default: strings.Join(agentmetrics.LabelAll, ","),
 		},
 		{
-			Name:        "Prometheus Collect Database Metrics",
-			Description: "Collect database metrics (may increase charges for metrics storage).",
-			Flag:        "prometheus-collect-db-metrics",
-			Env:         "CODER_PROMETHEUS_COLLECT_DB_METRICS",
-			Value:       &c.Prometheus.CollectDBMetrics,
-			Group:       &deploymentGroupIntrospectionPrometheus,
-			YAML:        "collect_db_metrics",
-			Default:     "false",
+			Name: "Prometheus Collect Database Metrics",
+			// Some db metrics like transaction information will still be collected.
+			// Query metrics blow up the number of unique time series with labels
+			// and can be very expensive. So default to not capturing query metrics.
+			Description: "Collect database query metrics (may increase charges for metrics storage). " +
+				"If set to false, a reduced set of database metrics are still collected.",
+			Flag:    "prometheus-collect-db-metrics",
+			Env:     "CODER_PROMETHEUS_COLLECT_DB_METRICS",
+			Value:   &c.Prometheus.CollectDBMetrics,
+			Group:   &deploymentGroupIntrospectionPrometheus,
+			YAML:    "collect_db_metrics",
+			Default: "false",
 		},
 		// Pprof settings
 		{
@@ -1348,6 +1595,26 @@ when required by your organization's security policy.`,
 			Value:       &c.OAuth2.Github.ClientSecret,
 			Annotations: serpent.Annotations{}.Mark(annotationSecretKey, "true"),
 			Group:       &deploymentGroupOAuth2GitHub,
+		},
+		{
+			Name:        "OAuth2 GitHub Device Flow",
+			Description: "Enable device flow for Login with GitHub.",
+			Flag:        "oauth2-github-device-flow",
+			Env:         "CODER_OAUTH2_GITHUB_DEVICE_FLOW",
+			Value:       &c.OAuth2.Github.DeviceFlow,
+			Group:       &deploymentGroupOAuth2GitHub,
+			YAML:        "deviceFlow",
+			Default:     "false",
+		},
+		{
+			Name:        "OAuth2 GitHub Default Provider Enable",
+			Description: "Enable the default GitHub OAuth2 provider managed by Coder.",
+			Flag:        "oauth2-github-default-provider-enable",
+			Env:         "CODER_OAUTH2_GITHUB_DEFAULT_PROVIDER_ENABLE",
+			Value:       &c.OAuth2.Github.DefaultProviderEnable,
+			Group:       &deploymentGroupOAuth2GitHub,
+			YAML:        "defaultProviderEnable",
+			Default:     "true",
 		},
 		{
 			Name:        "OAuth2 GitHub Allowed Orgs",
@@ -1531,6 +1798,62 @@ when required by your organization's security policy.`,
 			YAML:        "ignoreUserInfo",
 		},
 		{
+			Name: "OIDC Access Token Claims",
+			// This is a niche edge case that should not be advertised. Alternatives should
+			// be investigated before turning this on. A properly configured IdP should
+			// always have a userinfo endpoint which is preferred.
+			Hidden: true,
+			Description: "Source supplemental user claims from the 'access_token'. This assumes the " +
+				"token is a jwt signed by the same issuer as the id_token. Using this requires setting " +
+				"'oidc-ignore-userinfo' to true. This setting is not compliant with the OIDC specification " +
+				"and is not recommended. Use at your own risk.",
+			Flag:    "oidc-access-token-claims",
+			Env:     "CODER_OIDC_ACCESS_TOKEN_CLAIMS",
+			Default: "false",
+			Value:   &c.OIDC.UserInfoFromAccessToken,
+			Group:   &deploymentGroupOIDC,
+			YAML:    "accessTokenClaims",
+		},
+		{
+			Name: "OIDC Organization Field",
+			Description: "This field must be set if using the organization sync feature." +
+				" Set to the claim to be used for organizations.",
+			Flag: "oidc-organization-field",
+			Env:  "CODER_OIDC_ORGANIZATION_FIELD",
+			// Empty value means sync is disabled
+			Default: "",
+			Value:   &c.OIDC.OrganizationField,
+			Group:   &deploymentGroupOIDC,
+			YAML:    "organizationField",
+			Hidden:  true, // Use db runtime config instead
+		},
+		{
+			Name: "OIDC Assign Default Organization",
+			Description: "If set to true, users will always be added to the default organization. " +
+				"If organization sync is enabled, then the default org is always added to the user's set of expected" +
+				"organizations.",
+			Flag: "oidc-organization-assign-default",
+			Env:  "CODER_OIDC_ORGANIZATION_ASSIGN_DEFAULT",
+			// Single org deployments should always have this enabled.
+			Default: "true",
+			Value:   &c.OIDC.OrganizationAssignDefault,
+			Group:   &deploymentGroupOIDC,
+			YAML:    "organizationAssignDefault",
+			Hidden:  true, // Use db runtime config instead
+		},
+		{
+			Name: "OIDC Organization Sync Mapping",
+			Description: "A map of OIDC claims and the organizations in Coder it should map to. " +
+				"This is required because organization IDs must be used within Coder.",
+			Flag:    "oidc-organization-mapping",
+			Env:     "CODER_OIDC_ORGANIZATION_MAPPING",
+			Default: "{}",
+			Value:   &c.OIDC.OrganizationMapping,
+			Group:   &deploymentGroupOIDC,
+			YAML:    "organizationMapping",
+			Hidden:  true, // Use db runtime config instead
+		},
+		{
 			Name:        "OIDC Group Field",
 			Description: "This field must be set if using the group sync feature and the scope name is not 'groups'. Set to the claim to be used for groups.",
 			Flag:        "oidc-group-field",
@@ -1656,15 +1979,19 @@ when required by your organization's security policy.`,
 			YAML:  "dangerousSkipIssuerChecks",
 		},
 		// Telemetry settings
+		telemetryEnable,
 		{
-			Name:        "Telemetry Enable",
-			Description: "Whether telemetry is enabled or not. Coder collects anonymized usage data to help improve our product.",
-			Flag:        "telemetry",
-			Env:         "CODER_TELEMETRY_ENABLE",
-			Default:     strconv.FormatBool(flag.Lookup("test.v") == nil),
-			Value:       &c.Telemetry.Enable,
-			Group:       &deploymentGroupTelemetry,
-			YAML:        "enable",
+			Hidden: true,
+			Name:   "Telemetry (backwards compatibility)",
+			// Note the flip-flop of flag and env to maintain backwards
+			// compatibility and consistency. Inconsistently, the env
+			// was renamed to CODER_TELEMETRY_ENABLE in the past, but
+			// the flag was not renamed -enable.
+			Flag:       "telemetry-enable",
+			Env:        "CODER_TELEMETRY",
+			Value:      &c.Telemetry.Enable,
+			Group:      &deploymentGroupTelemetry,
+			UseInstead: []serpent.Option{telemetryEnable},
 		},
 		{
 			Name:        "Telemetry URL",
@@ -1883,6 +2210,18 @@ when required by your organization's security policy.`,
 			Group:       &deploymentGroupIntrospectionLogging,
 			YAML:        "enableTerraformDebugMode",
 		},
+		{
+			Name: "Additional CSP Policy",
+			Description: "Coder configures a Content Security Policy (CSP) to protect against XSS attacks. " +
+				"This setting allows you to add additional CSP directives, which can open the attack surface of the deployment. " +
+				"Format matches the CSP directive format, e.g. --additional-csp-policy=\"script-src https://example.com\".",
+			Flag:  "additional-csp-policy",
+			Env:   "CODER_ADDITIONAL_CSP_POLICY",
+			YAML:  "additionalCSPPolicy",
+			Value: &c.AdditionalCSPPolicy,
+			Group: &deploymentGroupNetworkingHTTP,
+		},
+
 		// ☢️ Dangerous settings
 		{
 			Name:        "DANGEROUS: Allow all CORS requests",
@@ -1948,6 +2287,16 @@ when required by your organization's security policy.`,
 			Annotations: serpent.Annotations{}.Mark(annotationFormatDuration, "true"),
 		},
 		{
+			Name:        "Default Token Lifetime",
+			Description: "The default lifetime duration for API tokens. This value is used when creating a token without specifying a duration, such as when authenticating the CLI or an IDE plugin.",
+			Flag:        "default-token-lifetime",
+			Env:         "CODER_DEFAULT_TOKEN_LIFETIME",
+			Default:     (7 * 24 * time.Hour).String(),
+			Value:       &c.Sessions.DefaultTokenDuration,
+			YAML:        "defaultTokenLifetime",
+			Annotations: serpent.Annotations{}.Mark(annotationFormatDuration, "true"),
+		},
+		{
 			Name:        "Enable swagger endpoint",
 			Description: "Expose the swagger endpoint via /swagger.",
 			Flag:        "swagger-enable",
@@ -1977,13 +2326,14 @@ when required by your organization's security policy.`,
 			Annotations: serpent.Annotations{}.Mark(annotationExternalProxies, "true"),
 		},
 		{
-			Name:        "Cache Directory",
-			Description: "The directory to cache temporary files. If unspecified and $CACHE_DIRECTORY is set, it will be used for compatibility with systemd.",
-			Flag:        "cache-dir",
-			Env:         "CODER_CACHE_DIRECTORY",
-			Default:     DefaultCacheDir(),
-			Value:       &c.CacheDir,
-			YAML:        "cacheDir",
+			Name: "Cache Directory",
+			Description: "The directory to cache temporary files. If unspecified and $CACHE_DIRECTORY is set, it will be used for compatibility with systemd. " +
+				"This directory is NOT safe to be configured as a shared directory across coderd/provisionerd replicas.",
+			Flag:    "cache-dir",
+			Env:     "CODER_CACHE_DIRECTORY",
+			Default: DefaultCacheDir(),
+			Value:   &c.CacheDir,
+			YAML:    "cacheDir",
 		},
 		{
 			Name:        "In Memory Database",
@@ -1995,8 +2345,17 @@ when required by your organization's security policy.`,
 			YAML:        "inMemoryDatabase",
 		},
 		{
+			Name:        "Ephemeral Deployment",
+			Description: "Controls whether Coder data, including built-in Postgres, will be stored in a temporary directory and deleted when the server is stopped.",
+			Flag:        "ephemeral",
+			Env:         "CODER_EPHEMERAL",
+			Hidden:      true,
+			Value:       &c.EphemeralDeployment,
+			YAML:        "ephemeralDeployment",
+		},
+		{
 			Name:        "Postgres Connection URL",
-			Description: "URL of a PostgreSQL database. If empty, PostgreSQL binaries will be downloaded from Maven (https://repo1.maven.org/maven2) and store all data in the config root. Access the built-in database with \"coder server postgres-builtin-url\".",
+			Description: "URL of a PostgreSQL database. If empty, PostgreSQL binaries will be downloaded from Maven (https://repo1.maven.org/maven2) and store all data in the config root. Access the built-in database with \"coder server postgres-builtin-url\". Note that any special characters in the URL must be URL-encoded.",
 			Flag:        "postgres-url",
 			Env:         "CODER_PG_CONNECTION_URL",
 			Annotations: serpent.Annotations{}.Mark(annotationSecretKey, "true"),
@@ -2004,7 +2363,7 @@ when required by your organization's security policy.`,
 		},
 		{
 			Name:        "Postgres Auth",
-			Description: "Type of auth to use when connecting to postgres.",
+			Description: "Type of auth to use when connecting to postgres. For AWS RDS, using IAM authentication (awsiamrds) is recommended.",
 			Flag:        "postgres-auth",
 			Env:         "CODER_PG_AUTH",
 			Default:     "password",
@@ -2088,7 +2447,7 @@ when required by your organization's security policy.`,
 			Flag:        "agent-fallback-troubleshooting-url",
 			Env:         "CODER_AGENT_FALLBACK_TROUBLESHOOTING_URL",
 			Hidden:      true,
-			Default:     "https://coder.com/docs/templates/troubleshooting",
+			Default:     "https://coder.com/docs/admin/templates/troubleshooting",
 			Value:       &c.AgentFallbackTroubleshootingURL,
 			YAML:        "agentFallbackTroubleshootingURL",
 		},
@@ -2323,6 +2682,21 @@ Write out the current server config as YAML to stdout.`,
 			YAML:        "thresholdDatabase",
 			Annotations: serpent.Annotations{}.Mark(annotationFormatDuration, "true"),
 		},
+		// Email options
+		emailFrom,
+		emailSmarthost,
+		emailHello,
+		emailForceTLS,
+		emailAuthIdentity,
+		emailAuthUsername,
+		emailAuthPassword,
+		emailAuthPasswordFile,
+		emailTLSStartTLS,
+		emailTLSServerName,
+		emailTLSSkipCertVerify,
+		emailTLSCertAuthorityFile,
+		emailTLSCertFile,
+		emailTLSCertKeyFile,
 		// Notifications Options
 		{
 			Name:        "Notifications: Method",
@@ -2353,36 +2727,37 @@ Write out the current server config as YAML to stdout.`,
 			Value:       &c.Notifications.SMTP.From,
 			Group:       &deploymentGroupNotificationsEmail,
 			YAML:        "from",
+			UseInstead:  serpent.OptionSet{emailFrom},
 		},
 		{
 			Name:        "Notifications: Email: Smarthost",
 			Description: "The intermediary SMTP host through which emails are sent.",
 			Flag:        "notifications-email-smarthost",
 			Env:         "CODER_NOTIFICATIONS_EMAIL_SMARTHOST",
-			Default:     "localhost:587", // To pass validation.
 			Value:       &c.Notifications.SMTP.Smarthost,
 			Group:       &deploymentGroupNotificationsEmail,
 			YAML:        "smarthost",
+			UseInstead:  serpent.OptionSet{emailSmarthost},
 		},
 		{
 			Name:        "Notifications: Email: Hello",
 			Description: "The hostname identifying the SMTP server.",
 			Flag:        "notifications-email-hello",
 			Env:         "CODER_NOTIFICATIONS_EMAIL_HELLO",
-			Default:     "localhost",
 			Value:       &c.Notifications.SMTP.Hello,
 			Group:       &deploymentGroupNotificationsEmail,
 			YAML:        "hello",
+			UseInstead:  serpent.OptionSet{emailHello},
 		},
 		{
 			Name:        "Notifications: Email: Force TLS",
 			Description: "Force a TLS connection to the configured SMTP smarthost.",
 			Flag:        "notifications-email-force-tls",
 			Env:         "CODER_NOTIFICATIONS_EMAIL_FORCE_TLS",
-			Default:     "false",
 			Value:       &c.Notifications.SMTP.ForceTLS,
 			Group:       &deploymentGroupNotificationsEmail,
 			YAML:        "forceTLS",
+			UseInstead:  serpent.OptionSet{emailForceTLS},
 		},
 		{
 			Name:        "Notifications: Email Auth: Identity",
@@ -2392,6 +2767,7 @@ Write out the current server config as YAML to stdout.`,
 			Value:       &c.Notifications.SMTP.Auth.Identity,
 			Group:       &deploymentGroupNotificationsEmailAuth,
 			YAML:        "identity",
+			UseInstead:  serpent.OptionSet{emailAuthIdentity},
 		},
 		{
 			Name:        "Notifications: Email Auth: Username",
@@ -2401,15 +2777,17 @@ Write out the current server config as YAML to stdout.`,
 			Value:       &c.Notifications.SMTP.Auth.Username,
 			Group:       &deploymentGroupNotificationsEmailAuth,
 			YAML:        "username",
+			UseInstead:  serpent.OptionSet{emailAuthUsername},
 		},
 		{
 			Name:        "Notifications: Email Auth: Password",
 			Description: "Password to use with PLAIN/LOGIN authentication.",
 			Flag:        "notifications-email-auth-password",
 			Env:         "CODER_NOTIFICATIONS_EMAIL_AUTH_PASSWORD",
+			Annotations: serpent.Annotations{}.Mark(annotationSecretKey, "true"),
 			Value:       &c.Notifications.SMTP.Auth.Password,
 			Group:       &deploymentGroupNotificationsEmailAuth,
-			YAML:        "password",
+			UseInstead:  serpent.OptionSet{emailAuthPassword},
 		},
 		{
 			Name:        "Notifications: Email Auth: Password File",
@@ -2419,6 +2797,7 @@ Write out the current server config as YAML to stdout.`,
 			Value:       &c.Notifications.SMTP.Auth.PasswordFile,
 			Group:       &deploymentGroupNotificationsEmailAuth,
 			YAML:        "passwordFile",
+			UseInstead:  serpent.OptionSet{emailAuthPasswordFile},
 		},
 		{
 			Name:        "Notifications: Email TLS: StartTLS",
@@ -2428,6 +2807,7 @@ Write out the current server config as YAML to stdout.`,
 			Value:       &c.Notifications.SMTP.TLS.StartTLS,
 			Group:       &deploymentGroupNotificationsEmailTLS,
 			YAML:        "startTLS",
+			UseInstead:  serpent.OptionSet{emailTLSStartTLS},
 		},
 		{
 			Name:        "Notifications: Email TLS: Server Name",
@@ -2437,6 +2817,7 @@ Write out the current server config as YAML to stdout.`,
 			Value:       &c.Notifications.SMTP.TLS.ServerName,
 			Group:       &deploymentGroupNotificationsEmailTLS,
 			YAML:        "serverName",
+			UseInstead:  serpent.OptionSet{emailTLSServerName},
 		},
 		{
 			Name:        "Notifications: Email TLS: Skip Certificate Verification (Insecure)",
@@ -2446,6 +2827,7 @@ Write out the current server config as YAML to stdout.`,
 			Value:       &c.Notifications.SMTP.TLS.InsecureSkipVerify,
 			Group:       &deploymentGroupNotificationsEmailTLS,
 			YAML:        "insecureSkipVerify",
+			UseInstead:  serpent.OptionSet{emailTLSSkipCertVerify},
 		},
 		{
 			Name:        "Notifications: Email TLS: Certificate Authority File",
@@ -2455,6 +2837,7 @@ Write out the current server config as YAML to stdout.`,
 			Value:       &c.Notifications.SMTP.TLS.CAFile,
 			Group:       &deploymentGroupNotificationsEmailTLS,
 			YAML:        "caCertFile",
+			UseInstead:  serpent.OptionSet{emailTLSCertAuthorityFile},
 		},
 		{
 			Name:        "Notifications: Email TLS: Certificate File",
@@ -2464,6 +2847,7 @@ Write out the current server config as YAML to stdout.`,
 			Value:       &c.Notifications.SMTP.TLS.CertFile,
 			Group:       &deploymentGroupNotificationsEmailTLS,
 			YAML:        "certFile",
+			UseInstead:  serpent.OptionSet{emailTLSCertFile},
 		},
 		{
 			Name:        "Notifications: Email TLS: Certificate Key File",
@@ -2473,6 +2857,7 @@ Write out the current server config as YAML to stdout.`,
 			Value:       &c.Notifications.SMTP.TLS.KeyFile,
 			Group:       &deploymentGroupNotificationsEmailTLS,
 			YAML:        "certKeyFile",
+			UseInstead:  serpent.OptionSet{emailTLSCertKeyFile},
 		},
 		{
 			Name:        "Notifications: Webhook: Endpoint",
@@ -2482,6 +2867,16 @@ Write out the current server config as YAML to stdout.`,
 			Value:       &c.Notifications.Webhook.Endpoint,
 			Group:       &deploymentGroupNotificationsWebhook,
 			YAML:        "endpoint",
+		},
+		{
+			Name:        "Notifications: Inbox: Enabled",
+			Description: "Enable Coder Inbox.",
+			Flag:        "notifications-inbox-enabled",
+			Env:         "CODER_NOTIFICATIONS_INBOX_ENABLED",
+			Value:       &c.Notifications.Inbox.Enabled,
+			Default:     "true",
+			Group:       &deploymentGroupInbox,
+			YAML:        "enabled",
 		},
 		{
 			Name:        "Notifications: Max Send Attempts",
@@ -2573,6 +2968,7 @@ Write out the current server config as YAML to stdout.`,
 			Annotations: serpent.Annotations{}.Mark(annotationFormatDuration, "true"),
 			Hidden:      true, // Hidden because most operators should not need to modify this.
 		},
+		// Push notifications.
 	}
 
 	return opts
@@ -2673,6 +3069,7 @@ func (c *Client) DeploymentStats(ctx context.Context) (DeploymentStats, error) {
 type AppearanceConfig struct {
 	ApplicationName string `json:"application_name"`
 	LogoURL         string `json:"logo_url"`
+	DocsURL         string `json:"docs_url"`
 	// Deprecated: ServiceBanner has been replaced by AnnouncementBanners.
 	ServiceBanner       BannerConfig   `json:"service_banner"`
 	AnnouncementBanners []BannerConfig `json:"announcement_banners"`
@@ -2742,6 +3139,8 @@ type BuildInfoResponse struct {
 	// AgentAPIVersion is the current version of the Agent API (back versions
 	// MAY still be supported).
 	AgentAPIVersion string `json:"agent_api_version"`
+	// ProvisionerAPIVersion is the current version of the Provisioner API
+	ProvisionerAPIVersion string `json:"provisioner_api_version"`
 
 	// UpgradeMessage is the message displayed to users when an outdated client
 	// is detected.
@@ -2749,6 +3148,9 @@ type BuildInfoResponse struct {
 
 	// DeploymentID is the unique identifier for this deployment.
 	DeploymentID string `json:"deployment_id"`
+
+	// WebPushPublicKey is the public key for push notifications via Web Push.
+	WebPushPublicKey string `json:"webpush_public_key,omitempty"`
 }
 
 type WorkspaceProxyBuildInfo struct {
@@ -2789,17 +3191,17 @@ const (
 	// Add new experiments here!
 	ExperimentExample            Experiment = "example"              // This isn't used for anything.
 	ExperimentAutoFillParameters Experiment = "auto-fill-parameters" // This should not be taken out of experiments until we have redesigned the feature.
-	ExperimentMultiOrganization  Experiment = "multi-organization"   // Requires organization context for interactions, default org is assumed.
-	ExperimentCustomRoles        Experiment = "custom-roles"         // Allows creating runtime custom roles.
 	ExperimentNotifications      Experiment = "notifications"        // Sends notifications via SMTP and webhooks following certain events.
 	ExperimentWorkspaceUsage     Experiment = "workspace-usage"      // Enables the new workspace usage tracking.
+	ExperimentWebPush            Experiment = "web-push"             // Enables web push notifications through the browser.
+	ExperimentDynamicParameters  Experiment = "dynamic-parameters"   // Enables dynamic parameters when creating a workspace.
 )
 
 // ExperimentsAll should include all experiments that are safe for
 // users to opt-in to via --experimental='*'.
 // Experiments that are not ready for consumption by all users should
 // not be included here and will be essentially hidden.
-var ExperimentsAll = Experiments{ExperimentNotifications}
+var ExperimentsAll = Experiments{}
 
 // Experiments is a list of experiments.
 // Multiple experiments may be enabled at the same time.
@@ -2998,4 +3400,35 @@ func (c *Client) SSHConfiguration(ctx context.Context) (SSHConfigResponse, error
 
 	var sshConfig SSHConfigResponse
 	return sshConfig, json.NewDecoder(res.Body).Decode(&sshConfig)
+}
+
+type CryptoKeyFeature string
+
+const (
+	CryptoKeyFeatureWorkspaceAppsAPIKey CryptoKeyFeature = "workspace_apps_api_key"
+	//nolint:gosec // This denotes a type of key, not a literal.
+	CryptoKeyFeatureWorkspaceAppsToken CryptoKeyFeature = "workspace_apps_token"
+	CryptoKeyFeatureOIDCConvert        CryptoKeyFeature = "oidc_convert"
+	CryptoKeyFeatureTailnetResume      CryptoKeyFeature = "tailnet_resume"
+)
+
+type CryptoKey struct {
+	Feature   CryptoKeyFeature `json:"feature"`
+	Secret    string           `json:"secret"`
+	DeletesAt time.Time        `json:"deletes_at" format:"date-time"`
+	Sequence  int32            `json:"sequence"`
+	StartsAt  time.Time        `json:"starts_at" format:"date-time"`
+}
+
+func (c CryptoKey) CanSign(now time.Time) bool {
+	now = now.UTC()
+	isAfterStartsAt := !c.StartsAt.IsZero() && !now.Before(c.StartsAt)
+	return isAfterStartsAt && c.CanVerify(now)
+}
+
+func (c CryptoKey) CanVerify(now time.Time) bool {
+	now = now.UTC()
+	hasSecret := c.Secret != ""
+	beforeDelete := c.DeletesAt.IsZero() || now.Before(c.DeletesAt)
+	return hasSecret && beforeDelete
 }

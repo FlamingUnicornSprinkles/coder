@@ -19,7 +19,8 @@ const (
 	ActionWorkspaceStart Action = "start"
 	ActionWorkspaceStop  Action = "stop"
 
-	ActionAssign Action = "assign"
+	ActionAssign   Action = "assign"
+	ActionUnassign Action = "unassign"
 
 	ActionReadPersonal   Action = "read_personal"
 	ActionUpdatePersonal Action = "update_personal"
@@ -32,6 +33,8 @@ type PermissionDefinition struct {
 	// should represent. The key in the actions map is the verb to use
 	// in the rbac policy.
 	Actions map[Action]ActionDefinition
+	// Comment is additional text to include in the generated object comment.
+	Comment string
 }
 
 type ActionDefinition struct {
@@ -133,8 +136,8 @@ var RBACPermissions = map[string]PermissionDefinition{
 	},
 	"template": {
 		Actions: map[Action]ActionDefinition{
-			ActionCreate: actDef("create a template"),
-			// TODO: Create a use permission maybe?
+			ActionCreate:       actDef("create a template"),
+			ActionUse:          actDef("use the template to initially create a workspace, then workspace lifecycle permissions take over"),
 			ActionRead:         actDef("read template"),
 			ActionUpdate:       actDef("update a template"),
 			ActionDelete:       actDef("delete a template"),
@@ -149,6 +152,11 @@ var RBACPermissions = map[string]PermissionDefinition{
 			ActionUpdate: actDef("update a group"),
 		},
 	},
+	"group_member": {
+		Actions: map[Action]ActionDefinition{
+			ActionRead: actDef("read group members"),
+		},
+	},
 	"file": {
 		Actions: map[Action]ActionDefinition{
 			ActionCreate: actDef("create a file"),
@@ -157,18 +165,16 @@ var RBACPermissions = map[string]PermissionDefinition{
 	},
 	"provisioner_daemon": {
 		Actions: map[Action]ActionDefinition{
-			ActionCreate: actDef("create a provisioner daemon"),
+			ActionCreate: actDef("create a provisioner daemon/key"),
 			// TODO: Move to use?
 			ActionRead:   actDef("read provisioner daemon"),
 			ActionUpdate: actDef("update a provisioner daemon"),
-			ActionDelete: actDef("delete a provisioner daemon"),
+			ActionDelete: actDef("delete a provisioner daemon/key"),
 		},
 	},
-	"provisioner_keys": {
+	"provisioner_jobs": {
 		Actions: map[Action]ActionDefinition{
-			ActionCreate: actDef("create a provisioner key"),
-			ActionRead:   actDef("read provisioner keys"),
-			ActionDelete: actDef("delete a provisioner key"),
+			ActionRead: actDef("read provisioner jobs"),
 		},
 	},
 	"organization": {
@@ -199,6 +205,10 @@ var RBACPermissions = map[string]PermissionDefinition{
 			ActionUpdate: actDef("update system resources"),
 			ActionDelete: actDef("delete system resources"),
 		},
+		Comment: `
+	// DEPRECATED: New resources should be created for new things, rather than adding them to System, which has become
+	//             an unmanaged collection of things that don't relate to one another. We can't effectively enforce
+	//             least privilege access control when unrelated resources are grouped together.`,
 	},
 	"api_key": {
 		Actions: map[Action]ActionDefinition{
@@ -210,49 +220,111 @@ var RBACPermissions = map[string]PermissionDefinition{
 	},
 	"tailnet_coordinator": {
 		Actions: map[Action]ActionDefinition{
-			ActionCreate: actDef(""),
-			ActionRead:   actDef(""),
-			ActionUpdate: actDef(""),
-			ActionDelete: actDef(""),
+			ActionCreate: actDef("create a Tailnet coordinator"),
+			ActionRead:   actDef("view info about a Tailnet coordinator"),
+			ActionUpdate: actDef("update a Tailnet coordinator"),
+			ActionDelete: actDef("delete a Tailnet coordinator"),
 		},
 	},
 	"assign_role": {
 		Actions: map[Action]ActionDefinition{
-			ActionAssign: actDef("ability to assign roles"),
-			ActionRead:   actDef("view what roles are assignable"),
-			ActionDelete: actDef("ability to unassign roles"),
-			ActionCreate: actDef("ability to create/delete/edit custom roles"),
+			ActionAssign:   actDef("assign user roles"),
+			ActionUnassign: actDef("unassign user roles"),
+			ActionRead:     actDef("view what roles are assignable"),
 		},
 	},
 	"assign_org_role": {
 		Actions: map[Action]ActionDefinition{
-			ActionAssign: actDef("ability to assign org scoped roles"),
-			ActionRead:   actDef("view what roles are assignable"),
-			ActionDelete: actDef("ability to delete org scoped roles"),
-			ActionCreate: actDef("ability to create/delete/edit custom roles within an organization"),
+			ActionAssign:   actDef("assign org scoped roles"),
+			ActionUnassign: actDef("unassign org scoped roles"),
+			ActionCreate:   actDef("create/delete custom roles within an organization"),
+			ActionRead:     actDef("view what roles are assignable within an organization"),
+			ActionUpdate:   actDef("edit custom roles within an organization"),
+			ActionDelete:   actDef("delete roles within an organization"),
 		},
 	},
 	"oauth2_app": {
 		Actions: map[Action]ActionDefinition{
-			ActionCreate: actDef("make an OAuth2 app."),
+			ActionCreate: actDef("make an OAuth2 app"),
 			ActionRead:   actDef("read OAuth2 apps"),
-			ActionUpdate: actDef("update the properties of the OAuth2 app."),
+			ActionUpdate: actDef("update the properties of the OAuth2 app"),
 			ActionDelete: actDef("delete an OAuth2 app"),
 		},
 	},
 	"oauth2_app_secret": {
 		Actions: map[Action]ActionDefinition{
-			ActionCreate: actDef(""),
-			ActionRead:   actDef(""),
-			ActionUpdate: actDef(""),
-			ActionDelete: actDef(""),
+			ActionCreate: actDef("create an OAuth2 app secret"),
+			ActionRead:   actDef("read an OAuth2 app secret"),
+			ActionUpdate: actDef("update an OAuth2 app secret"),
+			ActionDelete: actDef("delete an OAuth2 app secret"),
 		},
 	},
 	"oauth2_app_code_token": {
 		Actions: map[Action]ActionDefinition{
-			ActionCreate: actDef(""),
-			ActionRead:   actDef(""),
-			ActionDelete: actDef(""),
+			ActionCreate: actDef("create an OAuth2 app code token"),
+			ActionRead:   actDef("read an OAuth2 app code token"),
+			ActionDelete: actDef("delete an OAuth2 app code token"),
+		},
+	},
+	"notification_message": {
+		Actions: map[Action]ActionDefinition{
+			ActionCreate: actDef("create notification messages"),
+			ActionRead:   actDef("read notification messages"),
+			ActionUpdate: actDef("update notification messages"),
+			ActionDelete: actDef("delete notification messages"),
+		},
+	},
+	"notification_template": {
+		Actions: map[Action]ActionDefinition{
+			ActionRead:   actDef("read notification templates"),
+			ActionUpdate: actDef("update notification templates"),
+		},
+	},
+	"notification_preference": {
+		Actions: map[Action]ActionDefinition{
+			ActionRead:   actDef("read notification preferences"),
+			ActionUpdate: actDef("update notification preferences"),
+		},
+	},
+	"webpush_subscription": {
+		Actions: map[Action]ActionDefinition{
+			ActionCreate: actDef("create webpush subscriptions"),
+			ActionRead:   actDef("read webpush subscriptions"),
+			ActionDelete: actDef("delete webpush subscriptions"),
+		},
+	},
+	"inbox_notification": {
+		Actions: map[Action]ActionDefinition{
+			ActionCreate: actDef("create inbox notifications"),
+			ActionRead:   actDef("read inbox notifications"),
+			ActionUpdate: actDef("update inbox notifications"),
+		},
+	},
+	"crypto_key": {
+		Actions: map[Action]ActionDefinition{
+			ActionRead:   actDef("read crypto keys"),
+			ActionUpdate: actDef("update crypto keys"),
+			ActionDelete: actDef("delete crypto keys"),
+			ActionCreate: actDef("create crypto keys"),
+		},
+	},
+	// idpsync_settings should always be org scoped
+	"idpsync_settings": {
+		Actions: map[Action]ActionDefinition{
+			ActionRead:   actDef("read IdP sync settings"),
+			ActionUpdate: actDef("update IdP sync settings"),
+		},
+	},
+	"workspace_agent_resource_monitor": {
+		Actions: map[Action]ActionDefinition{
+			ActionRead:   actDef("read workspace agent resource monitor"),
+			ActionCreate: actDef("create workspace agent resource monitor"),
+			ActionUpdate: actDef("update workspace agent resource monitor"),
+		},
+	},
+	"workspace_agent_devcontainers": {
+		Actions: map[Action]ActionDefinition{
+			ActionCreate: actDef("create workspace agent devcontainers"),
 		},
 	},
 }

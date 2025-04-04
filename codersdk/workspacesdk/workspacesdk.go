@@ -12,31 +12,26 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/google/uuid"
-	"golang.org/x/xerrors"
-	"nhooyr.io/websocket"
 	"tailscale.com/tailcfg"
 	"tailscale.com/wgengine/capture"
 
+	"github.com/google/uuid"
+	"golang.org/x/xerrors"
+
 	"cdr.dev/slog"
+
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/tailnet"
 	"github.com/coder/coder/v2/tailnet/proto"
+	"github.com/coder/quartz"
+	"github.com/coder/websocket"
 )
-
-// AgentIP is a static IPv6 address with the Tailscale prefix that is used to route
-// connections from clients to this node. A dynamic address is not required because a Tailnet
-// client only dials a single agent at a time.
-//
-// Deprecated: use tailnet.IP() instead. This is kept for backwards
-// compatibility with outdated CLI clients and Workspace Proxies that dial it.
-// See: https://github.com/coder/coder/issues/11819
-var AgentIP = netip.MustParseAddr("fd7a:115c:a1e0:49d6:b259:b7ac:b1b2:48f4")
 
 var ErrSkipClose = xerrors.New("skip tailnet close")
 
 const (
 	AgentSSHPort             = tailnet.WorkspaceAgentSSHPort
+	AgentStandardSSHPort     = tailnet.WorkspaceAgentStandardSSHPort
 	AgentReconnectingPTYPort = tailnet.WorkspaceAgentReconnectingPTYPort
 	AgentSpeedtestPort       = tailnet.WorkspaceAgentSpeedtestPort
 	// AgentHTTPAPIServerPort serves a HTTP server with endpoints for e.g.
@@ -55,7 +50,11 @@ const (
 	AgentMinimumListeningPort = 9
 )
 
-const AgentAPIMismatchMessage = "Unknown or unsupported API version"
+const (
+	AgentAPIMismatchMessage = "Unknown or unsupported API version"
+
+	CoordinateAPIInvalidResumeToken = "Invalid resume token"
+)
 
 // AgentIgnoredListeningPorts contains a list of ports to ignore when looking for
 // running applications inside a workspace. We want to ignore non-HTTP servers,
@@ -124,6 +123,7 @@ func init() {
 	// Add a thousand more ports to the ignore list during tests so it's easier
 	// to find an available port.
 	for i := 63000; i < 64000; i++ {
+		// #nosec G115 - Safe conversion as port numbers are within uint16 range (0-65535)
 		AgentIgnoredListeningPorts[uint16(i)] = struct{}{}
 	}
 }
@@ -220,34 +220,27 @@ func (c *Client) DialAgent(dialCtx context.Context, agentID uuid.UUID, options *
 	if err != nil {
 		return nil, xerrors.Errorf("parse url: %w", err)
 	}
-	q := coordinateURL.Query()
-	// TODO (ethanndickson) - the current version includes 2 additions we don't currently use:
-	//
-	// 2.1 GetAnnouncementBanners on the Agent API (version locked to Tailnet API)
-	// 2.2 PostTelemetry on the Tailnet API
-	//
-	// So, asking for API 2.2 just makes us incompatible back level servers, for no real benefit.
-	// As a temporary measure, we'll specifically ask for API version 2.0 until we implement sending
-	// telemetry.
-	q.Add("version", "2.0")
-	coordinateURL.RawQuery = q.Encode()
 
-	connector := newTailnetAPIConnector(ctx, options.Logger, agentID, coordinateURL.String(),
-		&websocket.DialOptions{
-			HTTPClient: c.client.HTTPClient,
-			HTTPHeader: headers,
-			// Need to disable compression to avoid a data-race.
-			CompressionMode: websocket.CompressionDisabled,
-		})
+	dialer := NewWebsocketDialer(options.Logger, coordinateURL, &websocket.DialOptions{
+		HTTPClient: c.client.HTTPClient,
+		HTTPHeader: headers,
+		// Need to disable compression to avoid a data-race.
+		CompressionMode: websocket.CompressionDisabled,
+	})
+	clk := quartz.NewReal()
+	controller := tailnet.NewController(options.Logger, dialer)
+	controller.ResumeTokenCtrl = tailnet.NewBasicResumeTokenController(options.Logger, clk)
 
-	ip := tailnet.IP()
+	ip := tailnet.TailscaleServicePrefix.RandomAddr()
 	var header http.Header
 	if headerTransport, ok := c.client.HTTPClient.Transport.(*codersdk.HeaderTransport); ok {
 		header = headerTransport.Header
 	}
 	var telemetrySink tailnet.TelemetrySink
 	if options.EnableTelemetry {
-		telemetrySink = connector
+		basicTel := tailnet.NewBasicTelemetryController(options.Logger)
+		telemetrySink = basicTel
+		controller.TelemetryCtrl = basicTel
 	}
 	conn, err := tailnet.NewConn(&tailnet.Options{
 		Addresses:           []netip.Prefix{netip.PrefixFrom(ip, 128)},
@@ -268,14 +261,18 @@ func (c *Client) DialAgent(dialCtx context.Context, agentID uuid.UUID, options *
 			_ = conn.Close()
 		}
 	}()
-	connector.runConnector(conn)
+	coordCtrl := tailnet.NewTunnelSrcCoordController(options.Logger, conn)
+	coordCtrl.AddDestination(agentID)
+	controller.CoordCtrl = coordCtrl
+	controller.DERPCtrl = tailnet.NewBasicDERPController(options.Logger, conn)
+	controller.Run(ctx)
 
 	options.Logger.Debug(ctx, "running tailnet API v2+ connector")
 
 	select {
 	case <-dialCtx.Done():
 		return nil, xerrors.Errorf("timed out waiting for coordinator and derp map: %w", dialCtx.Err())
-	case err = <-connector.connected:
+	case err = <-dialer.Connected():
 		if err != nil {
 			options.Logger.Error(ctx, "failed to connect to tailnet v2+ API", slog.Error(err))
 			return nil, xerrors.Errorf("start connector: %w", err)
@@ -287,7 +284,7 @@ func (c *Client) DialAgent(dialCtx context.Context, agentID uuid.UUID, options *
 		AgentID: agentID,
 		CloseFunc: func() error {
 			cancel()
-			<-connector.closed
+			<-controller.Closed()
 			return conn.Close()
 		},
 	})
@@ -312,6 +309,21 @@ type WorkspaceAgentReconnectingPTYOpts struct {
 	// issue-reconnecting-pty-signed-token endpoint. If set, the session token
 	// on the client will not be sent.
 	SignedToken string
+
+	// Experimental: Container, if set, will attempt to exec into a running container
+	// visible to the agent. This should be a unique container ID
+	// (implementation-dependent).
+	// ContainerUser is the user as which to exec into the container.
+	// NOTE: This feature is currently experimental and is currently "opt-in".
+	// In order to use this feature, the agent must have the environment variable
+	// CODER_AGENT_DEVCONTAINERS_ENABLE set to "true".
+	Container     string
+	ContainerUser string
+
+	// BackendType is the type of backend to use for the PTY. If not set, the
+	// workspace agent will attempt to determine the preferred backend type.
+	// Supported values are "screen" and "buffered".
+	BackendType string
 }
 
 // AgentReconnectingPTY spawns a PTY that reconnects using the token provided.
@@ -327,6 +339,15 @@ func (c *Client) AgentReconnectingPTY(ctx context.Context, opts WorkspaceAgentRe
 	q.Set("width", strconv.Itoa(int(opts.Width)))
 	q.Set("height", strconv.Itoa(int(opts.Height)))
 	q.Set("command", opts.Command)
+	if opts.Container != "" {
+		q.Set("container", opts.Container)
+	}
+	if opts.ContainerUser != "" {
+		q.Set("container_user", opts.ContainerUser)
+	}
+	if opts.BackendType != "" {
+		q.Set("backend_type", opts.BackendType)
+	}
 	// If we're using a signed token, set the query parameter.
 	if opts.SignedToken != "" {
 		q.Set(codersdk.SignedAppTokenQueryParameter, opts.SignedToken)

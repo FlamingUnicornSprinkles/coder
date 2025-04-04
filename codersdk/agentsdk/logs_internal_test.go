@@ -2,17 +2,15 @@ package agentsdk
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
 	"golang.org/x/xerrors"
 	protobuf "google.golang.org/protobuf/proto"
 
-	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/agent/proto"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/codersdk"
@@ -23,7 +21,7 @@ func TestLogSender_Mainline(t *testing.T) {
 	t.Parallel()
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	ctx, cancel := context.WithCancel(testCtx)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	uut := NewLogSender(logger)
 
@@ -128,7 +126,7 @@ func TestLogSender_Mainline(t *testing.T) {
 func TestLogSender_LogLimitExceeded(t *testing.T) {
 	t.Parallel()
 	ctx := testutil.Context(t, testutil.WaitShort)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	uut := NewLogSender(logger)
 
@@ -159,7 +157,7 @@ func TestLogSender_LogLimitExceeded(t *testing.T) {
 		&proto.BatchCreateLogsResponse{LogLimitExceeded: true})
 
 	err := testutil.RequireRecvCtx(ctx, t, loopErr)
-	require.ErrorIs(t, err, LogLimitExceededError)
+	require.ErrorIs(t, err, ErrLogLimitExceeded)
 
 	// Should also unblock WaitUntilEmpty
 	err = testutil.RequireRecvCtx(ctx, t, empty)
@@ -182,14 +180,14 @@ func TestLogSender_LogLimitExceeded(t *testing.T) {
 		loopErr <- err
 	}()
 	err = testutil.RequireRecvCtx(ctx, t, loopErr)
-	require.ErrorIs(t, err, LogLimitExceededError)
+	require.ErrorIs(t, err, ErrLogLimitExceeded)
 }
 
 func TestLogSender_SkipHugeLog(t *testing.T) {
 	t.Parallel()
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	ctx, cancel := context.WithCancel(testCtx)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	uut := NewLogSender(logger)
 
@@ -235,7 +233,7 @@ func TestLogSender_InvalidUTF8(t *testing.T) {
 	t.Parallel()
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	ctx, cancel := context.WithCancel(testCtx)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	uut := NewLogSender(logger)
 
@@ -280,7 +278,7 @@ func TestLogSender_Batch(t *testing.T) {
 	t.Parallel()
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	ctx, cancel := context.WithCancel(testCtx)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	uut := NewLogSender(logger)
 
@@ -330,7 +328,7 @@ func TestLogSender_MaxQueuedLogs(t *testing.T) {
 	t.Parallel()
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	ctx, cancel := context.WithCancel(testCtx)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	uut := NewLogSender(logger)
 
@@ -389,7 +387,7 @@ func TestLogSender_MaxQueuedLogs(t *testing.T) {
 func TestLogSender_SendError(t *testing.T) {
 	t.Parallel()
 	ctx := testutil.Context(t, testutil.WaitShort)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	fDest := newFakeLogDest()
 	expectedErr := xerrors.New("test")
 	fDest.err = expectedErr
@@ -431,7 +429,7 @@ func TestLogSender_WaitUntilEmpty_ContextExpired(t *testing.T) {
 	t.Parallel()
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	ctx, cancel := context.WithCancel(testCtx)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	uut := NewLogSender(logger)
 
 	t0 := dbtime.Now()

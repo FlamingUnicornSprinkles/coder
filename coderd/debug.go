@@ -7,10 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
-	"golang.org/x/exp/slices"
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
@@ -20,6 +20,7 @@ import (
 	"github.com/coder/coder/v2/coderd/httpmw"
 	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/coderd/rbac/policy"
+	"github.com/coder/coder/v2/coderd/util/slice"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/healthsdk"
 )
@@ -250,7 +251,7 @@ func (api *API) putDeploymentHealthSettings(rw http.ResponseWriter, r *http.Requ
 
 	aReq.New = database.HealthSettings{
 		ID:                    uuid.New(),
-		DismissedHealthchecks: settings.DismissedHealthchecks,
+		DismissedHealthchecks: slice.ToStrings(settings.DismissedHealthchecks),
 	}
 
 	err = api.Database.UpsertHealthSettings(ctx, string(settingsJSON))

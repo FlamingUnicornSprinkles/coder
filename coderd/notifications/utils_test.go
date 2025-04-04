@@ -2,64 +2,38 @@ package notifications_test
 
 import (
 	"context"
-	"database/sql"
+	"net/url"
 	"sync/atomic"
 	"testing"
+	"text/template"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/stretchr/testify/require"
 
-	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/serpent"
 
 	"github.com/coder/coder/v2/coderd/database"
-	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbgen"
-	"github.com/coder/coder/v2/coderd/database/dbmem"
-	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/notifications"
 	"github.com/coder/coder/v2/coderd/notifications/dispatch"
 	"github.com/coder/coder/v2/coderd/notifications/types"
 	"github.com/coder/coder/v2/codersdk"
-	"github.com/coder/coder/v2/testutil"
 )
 
-func setup(t *testing.T) (context.Context, slog.Logger, database.Store) {
-	t.Helper()
-
-	connectionURL, closeFunc, err := dbtestutil.Open()
-	require.NoError(t, err)
-	t.Cleanup(closeFunc)
-
-	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitSuperLong)
-	t.Cleanup(cancel)
-	logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true, IgnoredErrorIs: []error{}}).Leveled(slog.LevelDebug)
-
-	sqlDB, err := sql.Open("postgres", connectionURL)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, sqlDB.Close())
-	})
-
-	// nolint:gocritic // unit tests.
-	return dbauthz.AsSystemRestricted(ctx), logger, database.New(sqlDB)
-}
-
-func setupInMemory(t *testing.T) (context.Context, slog.Logger, database.Store) {
-	t.Helper()
-
-	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
-	t.Cleanup(cancel)
-	logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true, IgnoredErrorIs: []error{}}).Leveled(slog.LevelDebug)
-
-	// nolint:gocritic // unit tests.
-	return dbauthz.AsSystemRestricted(ctx), logger, dbmem.New()
-}
-
 func defaultNotificationsConfig(method database.NotificationMethod) codersdk.NotificationsConfig {
+	var (
+		smtp    codersdk.NotificationsEmailConfig
+		webhook codersdk.NotificationsWebhookConfig
+	)
+
+	switch method {
+	case database.NotificationMethodSmtp:
+		smtp.Smarthost = serpent.String("localhost:1337")
+	case database.NotificationMethodWebhook:
+		webhook.Endpoint = serpent.URL(url.URL{Host: "localhost"})
+	}
+
 	return codersdk.NotificationsConfig{
 		Method:              serpent.String(method),
 		MaxSendAttempts:     5,
@@ -70,14 +44,20 @@ func defaultNotificationsConfig(method database.NotificationMethod) codersdk.Not
 		RetryInterval:       serpent.Duration(time.Millisecond * 50),
 		LeaseCount:          10,
 		StoreSyncBufferSize: 50,
-		SMTP:                codersdk.NotificationsEmailConfig{},
-		Webhook:             codersdk.NotificationsWebhookConfig{},
+		SMTP:                smtp,
+		Webhook:             webhook,
+		Inbox: codersdk.NotificationsInboxConfig{
+			Enabled: serpent.Bool(true),
+		},
 	}
 }
 
 func defaultHelpers() map[string]any {
 	return map[string]any{
-		"base_url": func() string { return "http://test.com" },
+		"base_url":     func() string { return "http://test.com" },
+		"current_year": func() string { return "2024" },
+		"logo_url":     func() string { return "https://coder.com/coder-logo-horizontal.png" },
+		"app_name":     func() string { return "Coder" },
 	}
 }
 
@@ -106,9 +86,9 @@ func newDispatchInterceptor(h notifications.Handler) *dispatchInterceptor {
 	return &dispatchInterceptor{handler: h}
 }
 
-func (i *dispatchInterceptor) Dispatcher(payload types.MessagePayload, title, body string) (dispatch.DeliveryFunc, error) {
+func (i *dispatchInterceptor) Dispatcher(payload types.MessagePayload, title, body string, _ template.FuncMap) (dispatch.DeliveryFunc, error) {
 	return func(ctx context.Context, msgID uuid.UUID) (retryable bool, err error) {
-		deliveryFn, err := i.handler.Dispatcher(payload, title, body)
+		deliveryFn, err := i.handler.Dispatcher(payload, title, body, defaultHelpers())
 		if err != nil {
 			return false, err
 		}
@@ -131,3 +111,43 @@ func (i *dispatchInterceptor) Dispatcher(payload types.MessagePayload, title, bo
 		return retryable, err
 	}, nil
 }
+
+type dispatchCall struct {
+	payload     types.MessagePayload
+	title, body string
+	result      chan<- dispatchResult
+}
+
+type dispatchResult struct {
+	retryable bool
+	err       error
+}
+
+type chanHandler struct {
+	calls chan dispatchCall
+}
+
+func (c chanHandler) Dispatcher(payload types.MessagePayload, title, body string, _ template.FuncMap) (dispatch.DeliveryFunc, error) {
+	result := make(chan dispatchResult)
+	call := dispatchCall{
+		payload: payload,
+		title:   title,
+		body:    body,
+		result:  result,
+	}
+	return func(ctx context.Context, _ uuid.UUID) (bool, error) {
+		select {
+		case c.calls <- call:
+			select {
+			case r := <-result:
+				return r.retryable, r.err
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}, nil
+}
+
+var _ notifications.Handler = &chanHandler{}

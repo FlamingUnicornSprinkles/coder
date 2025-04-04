@@ -1,6 +1,7 @@
 package terraform
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -9,7 +10,11 @@ import (
 	"github.com/mitchellh/mapstructure"
 	"golang.org/x/xerrors"
 
-	"github.com/coder/terraform-provider-coder/provider"
+	"cdr.dev/slog"
+
+	"github.com/coder/terraform-provider-coder/v2/provider"
+
+	tfaddr "github.com/hashicorp/go-terraform-address"
 
 	"github.com/coder/coder/v2/coderd/util/slice"
 	stringutil "github.com/coder/coder/v2/coderd/util/strings"
@@ -37,7 +42,7 @@ type agentAttributes struct {
 	ID              string            `mapstructure:"id"`
 	Token           string            `mapstructure:"token"`
 	Env             map[string]string `mapstructure:"env"`
-	// Deprecated, but remains here for backwards compatibility.
+	// Deprecated: but remains here for backwards compatibility.
 	StartupScript                string `mapstructure:"startup_script"`
 	StartupScriptBehavior        string `mapstructure:"startup_script_behavior"`
 	StartupScriptTimeoutSeconds  int32  `mapstructure:"startup_script_timeout"`
@@ -51,6 +56,29 @@ type agentAttributes struct {
 	Metadata                 []agentMetadata              `mapstructure:"metadata"`
 	DisplayApps              []agentDisplayAppsAttributes `mapstructure:"display_apps"`
 	Order                    int64                        `mapstructure:"order"`
+	ResourcesMonitoring      []agentResourcesMonitoring   `mapstructure:"resources_monitoring"`
+}
+
+type agentDevcontainerAttributes struct {
+	AgentID         string `mapstructure:"agent_id"`
+	WorkspaceFolder string `mapstructure:"workspace_folder"`
+	ConfigPath      string `mapstructure:"config_path"`
+}
+
+type agentResourcesMonitoring struct {
+	Memory  []agentMemoryResourceMonitor `mapstructure:"memory"`
+	Volumes []agentVolumeResourceMonitor `mapstructure:"volume"`
+}
+
+type agentMemoryResourceMonitor struct {
+	Enabled   bool  `mapstructure:"enabled"`
+	Threshold int32 `mapstructure:"threshold"`
+}
+
+type agentVolumeResourceMonitor struct {
+	Path      string `mapstructure:"path"`
+	Enabled   bool   `mapstructure:"enabled"`
+	Threshold int32  `mapstructure:"threshold"`
 }
 
 type agentDisplayAppsAttributes struct {
@@ -78,6 +106,8 @@ type agentAppAttributes struct {
 	Subdomain   bool                       `mapstructure:"subdomain"`
 	Healthcheck []appHealthcheckAttributes `mapstructure:"healthcheck"`
 	Order       int64                      `mapstructure:"order"`
+	Hidden      bool                       `mapstructure:"hidden"`
+	OpenIn      string                     `mapstructure:"open_in"`
 }
 
 type agentEnvAttributes struct {
@@ -125,13 +155,16 @@ type resourceMetadataItem struct {
 type State struct {
 	Resources             []*proto.Resource
 	Parameters            []*proto.RichParameter
+	Presets               []*proto.Preset
 	ExternalAuthProviders []*proto.ExternalAuthProviderResource
 }
+
+var ErrInvalidTerraformAddr = xerrors.New("invalid terraform address")
 
 // ConvertState consumes Terraform state and a GraphViz representation
 // produced by `terraform graph` to produce resources consumable by Coder.
 // nolint:gocognit // This function makes more sense being large for now, until refactored.
-func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error) {
+func ConvertState(ctx context.Context, modules []*tfjson.StateModule, rawGraph string, logger slog.Logger) (*State, error) {
 	parsedGraph, err := gographviz.ParseString(rawGraph)
 	if err != nil {
 		return nil, xerrors.Errorf("parse graph: %w", err)
@@ -150,7 +183,7 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 
 	// Extra array to preserve the order of rich parameters.
 	tfResourcesRichParameters := make([]*tfjson.StateResource, 0)
-
+	tfResourcesPresets := make([]*tfjson.StateResource, 0)
 	var findTerraformResources func(mod *tfjson.StateModule)
 	findTerraformResources = func(mod *tfjson.StateModule) {
 		for _, module := range mod.ChildModules {
@@ -159,6 +192,9 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 		for _, resource := range mod.Resources {
 			if resource.Type == "coder_parameter" {
 				tfResourcesRichParameters = append(tfResourcesRichParameters, resource)
+			}
+			if resource.Type == "coder_workspace_preset" {
+				tfResourcesPresets = append(tfResourcesPresets, resource)
 			}
 
 			label := convertAddressToLabel(resource.Address)
@@ -185,10 +221,25 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 				return nil, xerrors.Errorf("decode agent attributes: %w", err)
 			}
 
-			if _, ok := agentNames[tfResource.Name]; ok {
+			// Similar logic is duplicated in terraform/resources.go.
+			if tfResource.Name == "" {
+				return nil, xerrors.Errorf("agent name cannot be empty")
+			}
+			// In 2025-02 we removed support for underscores in agent names. To
+			// provide a nicer error message, we check the regex first and check
+			// for underscores if it fails.
+			if !provisioner.AgentNameRegex.MatchString(tfResource.Name) {
+				if strings.Contains(tfResource.Name, "_") {
+					return nil, xerrors.Errorf("agent name %q contains underscores which are no longer supported, please use hyphens instead (regex: %q)", tfResource.Name, provisioner.AgentNameRegex.String())
+				}
+				return nil, xerrors.Errorf("agent name %q does not match regex %q", tfResource.Name, provisioner.AgentNameRegex.String())
+			}
+			// Agent names must be case-insensitive-unique, to be unambiguous in
+			// `coder_app`s and CoderVPN DNS names.
+			if _, ok := agentNames[strings.ToLower(tfResource.Name)]; ok {
 				return nil, xerrors.Errorf("duplicate agent name: %s", tfResource.Name)
 			}
-			agentNames[tfResource.Name] = struct{}{}
+			agentNames[strings.ToLower(tfResource.Name)] = struct{}{}
 
 			// Handling for deprecated attributes. login_before_ready was replaced
 			// by startup_script_behavior, but we still need to support it for
@@ -230,6 +281,29 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 				}
 			}
 
+			resourcesMonitoring := &proto.ResourcesMonitoring{
+				Volumes: make([]*proto.VolumeResourceMonitor, 0),
+			}
+
+			for _, resource := range attrs.ResourcesMonitoring {
+				for _, memoryResource := range resource.Memory {
+					resourcesMonitoring.Memory = &proto.MemoryResourceMonitor{
+						Enabled:   memoryResource.Enabled,
+						Threshold: memoryResource.Threshold,
+					}
+				}
+			}
+
+			for _, resource := range attrs.ResourcesMonitoring {
+				for _, volume := range resource.Volumes {
+					resourcesMonitoring.Volumes = append(resourcesMonitoring.Volumes, &proto.VolumeResourceMonitor{
+						Path:      volume.Path,
+						Enabled:   volume.Enabled,
+						Threshold: volume.Threshold,
+					})
+				}
+			}
+
 			agent := &proto.Agent{
 				Name:                     tfResource.Name,
 				Id:                       attrs.ID,
@@ -240,6 +314,7 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 				ConnectionTimeoutSeconds: attrs.ConnectionTimeoutSeconds,
 				TroubleshootingUrl:       attrs.TroubleshootingURL,
 				MotdFile:                 attrs.MOTDFile,
+				ResourcesMonitoring:      resourcesMonitoring,
 				Metadata:                 metadata,
 				DisplayApps:              displayApps,
 				Order:                    attrs.Order,
@@ -387,6 +462,7 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 			if attrs.Slug == "" {
 				attrs.Slug = resource.Name
 			}
+			// Similar logic is duplicated in terraform/resources.go.
 			if attrs.DisplayName == "" {
 				if attrs.Name != "" {
 					// Name is deprecated but still accepted.
@@ -396,8 +472,10 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 				}
 			}
 
+			// Contrary to agent names above, app slugs were never permitted to
+			// contain uppercase letters or underscores.
 			if !provisioner.AppSlugRegex.MatchString(attrs.Slug) {
-				return nil, xerrors.Errorf("invalid app slug %q, please update your coder/coder provider to the latest version and specify the slug property on each coder_app", attrs.Slug)
+				return nil, xerrors.Errorf("app slug %q does not match regex %q", attrs.Slug, provisioner.AppSlugRegex.String())
 			}
 
 			if _, exists := appSlugs[attrs.Slug]; exists {
@@ -424,6 +502,14 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 				sharingLevel = proto.AppSharingLevel_PUBLIC
 			}
 
+			openIn := proto.AppOpenIn_SLIM_WINDOW
+			switch strings.ToLower(attrs.OpenIn) {
+			case "slim-window":
+				openIn = proto.AppOpenIn_SLIM_WINDOW
+			case "tab":
+				openIn = proto.AppOpenIn_TAB
+			}
+
 			for _, agents := range resourceAgents {
 				for _, agent := range agents {
 					// Find agents with the matching ID and associate them!
@@ -443,6 +529,8 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 						SharingLevel: sharingLevel,
 						Healthcheck:  healthcheck,
 						Order:        attrs.Order,
+						Hidden:       attrs.Hidden,
+						OpenIn:       openIn,
 					})
 				}
 			}
@@ -502,6 +590,33 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 						RunOnStart:       attrs.RunOnStart,
 						RunOnStop:        attrs.RunOnStop,
 						TimeoutSeconds:   attrs.TimeoutSeconds,
+					})
+				}
+			}
+		}
+	}
+
+	// Associate Dev Containers with agents.
+	for _, resources := range tfResourcesByLabel {
+		for _, resource := range resources {
+			if resource.Type != "coder_devcontainer" {
+				continue
+			}
+			var attrs agentDevcontainerAttributes
+			err = mapstructure.Decode(resource.AttributeValues, &attrs)
+			if err != nil {
+				return nil, xerrors.Errorf("decode script attributes: %w", err)
+			}
+			for _, agents := range resourceAgents {
+				for _, agent := range agents {
+					// Find agents with the matching ID and associate them!
+					if !dependsOnAgent(graph, agent, attrs.AgentID, resource) {
+						continue
+					}
+					agent.Devcontainers = append(agent.Devcontainers, &proto.Devcontainer{
+						Name:            resource.Name,
+						WorkspaceFolder: attrs.WorkspaceFolder,
+						ConfigPath:      attrs.ConfigPath,
 					})
 				}
 			}
@@ -591,6 +706,20 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 				continue
 			}
 			label := convertAddressToLabel(resource.Address)
+			modulePath, err := convertAddressToModulePath(resource.Address)
+			if err != nil {
+				// Module path recording was added primarily to keep track of
+				// modules in telemetry. We're adding this sentinel value so
+				// we can detect if there are any issues with the address
+				// parsing.
+				//
+				// We don't want to set modulePath to null here because, in
+				// the database, a null value in WorkspaceResource's ModulePath
+				// indicates "this resource was created before module paths
+				// were tracked."
+				modulePath = fmt.Sprintf("%s", ErrInvalidTerraformAddr)
+				logger.Error(ctx, "failed to parse Terraform address", slog.F("address", resource.Address))
+			}
 
 			agents, exists := resourceAgents[label]
 			if exists {
@@ -606,6 +735,7 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 				Icon:         resourceIcon[label],
 				DailyCost:    resourceCost[label],
 				InstanceType: applyInstanceType(resource),
+				ModulePath:   modulePath,
 			})
 		}
 	}
@@ -627,8 +757,9 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 			DefaultValue: param.Default,
 			Icon:         param.Icon,
 			Required:     !param.Optional,
-			Order:        int32(param.Order),
-			Ephemeral:    param.Ephemeral,
+			// #nosec G115 - Safe conversion as parameter order value is expected to be within int32 range
+			Order:     int32(param.Order),
+			Ephemeral: param.Ephemeral,
 		}
 		if len(param.Validation) == 1 {
 			protoParam.ValidationRegex = param.Validation[0].Regex
@@ -700,6 +831,78 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 		)
 	}
 
+	var duplicatedPresetNames []string
+	presets := make([]*proto.Preset, 0)
+	for _, resource := range tfResourcesPresets {
+		var preset provider.WorkspacePreset
+		err = mapstructure.Decode(resource.AttributeValues, &preset)
+		if err != nil {
+			return nil, xerrors.Errorf("decode preset attributes: %w", err)
+		}
+
+		var duplicatedPresetParameterNames []string
+		var nonExistentParameters []string
+		var presetParameters []*proto.PresetParameter
+		for name, value := range preset.Parameters {
+			presetParameter := &proto.PresetParameter{
+				Name:  name,
+				Value: value,
+			}
+
+			formattedName := fmt.Sprintf("%q", name)
+			if !slice.Contains(duplicatedPresetParameterNames, formattedName) &&
+				slice.ContainsCompare(presetParameters, presetParameter, func(a, b *proto.PresetParameter) bool {
+					return a.Name == b.Name
+				}) {
+				duplicatedPresetParameterNames = append(duplicatedPresetParameterNames, formattedName)
+			}
+			if !slice.ContainsCompare(parameters, &proto.RichParameter{Name: name}, func(a, b *proto.RichParameter) bool {
+				return a.Name == b.Name
+			}) {
+				nonExistentParameters = append(nonExistentParameters, name)
+			}
+
+			presetParameters = append(presetParameters, presetParameter)
+		}
+
+		if len(duplicatedPresetParameterNames) > 0 {
+			s := ""
+			if len(duplicatedPresetParameterNames) == 1 {
+				s = "s"
+			}
+			return nil, xerrors.Errorf(
+				"coder_workspace_preset parameters must be unique but %s appear%s multiple times", stringutil.JoinWithConjunction(duplicatedPresetParameterNames), s,
+			)
+		}
+
+		if len(nonExistentParameters) > 0 {
+			logger.Warn(
+				ctx,
+				"coder_workspace_preset defines preset values for at least one parameter that is not defined by the template",
+				slog.F("parameters", stringutil.JoinWithConjunction(nonExistentParameters)),
+			)
+		}
+
+		protoPreset := &proto.Preset{
+			Name:       preset.Name,
+			Parameters: presetParameters,
+		}
+		if slice.Contains(duplicatedPresetNames, preset.Name) {
+			duplicatedPresetNames = append(duplicatedPresetNames, preset.Name)
+		}
+		presets = append(presets, protoPreset)
+	}
+	if len(duplicatedPresetNames) > 0 {
+		s := ""
+		if len(duplicatedPresetNames) == 1 {
+			s = "s"
+		}
+		return nil, xerrors.Errorf(
+			"coder_workspace_preset names must be unique but %s appear%s multiple times",
+			stringutil.JoinWithConjunction(duplicatedPresetNames), s,
+		)
+	}
+
 	// A map is used to ensure we don't have duplicates!
 	externalAuthProvidersMap := map[string]*proto.ExternalAuthProviderResource{}
 	for _, tfResources := range tfResourcesByLabel {
@@ -733,11 +936,13 @@ func ConvertState(modules []*tfjson.StateModule, rawGraph string) (*State, error
 	return &State{
 		Resources:             resources,
 		Parameters:            parameters,
+		Presets:               presets,
 		ExternalAuthProviders: externalAuthProviders,
 	}, nil
 }
 
 func PtrInt32(number int) *int32 {
+	// #nosec G115 - Safe conversion as the number is expected to be within int32 range
 	n := int32(number)
 	return &n
 }
@@ -748,6 +953,20 @@ func PtrInt32(number int) *int32 {
 func convertAddressToLabel(address string) string {
 	cut, _, _ := strings.Cut(address, "[")
 	return cut
+}
+
+// convertAddressToModulePath returns the module path from a Terraform address.
+// eg. "module.ec2_dev.ec2_instance.dev[0]" becomes "module.ec2_dev".
+// Empty string is returned for the root module.
+//
+// Module paths are defined in the Terraform spec:
+// https://github.com/hashicorp/terraform/blob/ef071f3d0e49ba421ae931c65b263827a8af1adb/website/docs/internals/resource-addressing.html.markdown#module-path
+func convertAddressToModulePath(address string) (string, error) {
+	addr, err := tfaddr.NewAddress(address)
+	if err != nil {
+		return "", xerrors.Errorf("parse terraform address: %w", err)
+	}
+	return addr.ModulePath.String(), nil
 }
 
 func dependsOnAgent(graph *gographviz.Graph, agent *proto.Agent, resourceAgentID string, resource *tfjson.StateResource) bool {

@@ -17,8 +17,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/agent"
 	agentproto "github.com/coder/coder/v2/agent/proto"
 	"github.com/coder/coder/v2/coderd/coderdtest"
@@ -129,7 +127,7 @@ func (d *Details) AppClient(t *testing.T) *codersdk.Client {
 	client := codersdk.New(d.PathAppBaseURL)
 	client.SetSessionToken(d.SDKClient.SessionToken())
 	forceURLTransport(t, client)
-	client.HTTPClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+	client.HTTPClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 
@@ -184,7 +182,7 @@ func setupProxyTestWithFactory(t *testing.T, factory DeploymentFactory, opts *De
 
 	// Configure the HTTP client to not follow redirects and to route all
 	// requests regardless of hostname to the coderd test server.
-	deployment.SDKClient.HTTPClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+	deployment.SDKClient.HTTPClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 	forceURLTransport(t, deployment.SDKClient)
@@ -441,7 +439,7 @@ func createWorkspaceWithApps(t *testing.T, client *codersdk.Client, orgID uuid.U
 	}
 	agentCloser := agent.New(agent.Options{
 		Client: agentClient,
-		Logger: slogtest.Make(t, nil).Named("agent").Leveled(slog.LevelDebug),
+		Logger: testutil.Logger(t).Named("agent"),
 	})
 	t.Cleanup(func() {
 		_ = agentCloser.Close()

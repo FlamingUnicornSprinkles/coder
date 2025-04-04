@@ -9,13 +9,11 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/xerrors"
 
-	"github.com/coder/coder/v2/coderd"
 	"github.com/coder/coder/v2/coderd/audit"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/db2sdk"
 	"github.com/coder/coder/v2/coderd/httpapi"
 	"github.com/coder/coder/v2/coderd/httpmw"
-	"github.com/coder/coder/v2/coderd/rbac/policy"
 	"github.com/coder/coder/v2/codersdk"
 )
 
@@ -63,6 +61,7 @@ func (api *API) postGroupByOrganization(rw http.ResponseWriter, r *http.Request)
 		DisplayName:    req.DisplayName,
 		OrganizationID: org.ID,
 		AvatarURL:      req.AvatarURL,
+		// #nosec G115 - Quota allowance is small and fits in int32
 		QuotaAllowance: int32(req.QuotaAllowance),
 	})
 	if database.IsUniqueViolation(err) {
@@ -77,10 +76,14 @@ func (api *API) postGroupByOrganization(rw http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var emptyUsers []database.User
-	aReq.New = group.Auditable(emptyUsers)
+	var emptyMembers []database.GroupMember
+	aReq.New = group.Auditable(emptyMembers)
 
-	httpapi.Write(ctx, rw, http.StatusCreated, db2sdk.Group(group, nil))
+	httpapi.Write(ctx, rw, http.StatusCreated, db2sdk.Group(database.GetGroupsRow{
+		Group:                   group,
+		OrganizationName:        org.Name,
+		OrganizationDisplayName: org.DisplayName,
+	}, nil, 0))
 }
 
 // @Summary Update group by name
@@ -151,7 +154,10 @@ func (api *API) patchGroup(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	currentMembers, err := api.Database.GetGroupMembersByGroupID(ctx, group.ID)
+	currentMembers, err := api.Database.GetGroupMembersByGroupID(ctx, database.GetGroupMembersByGroupIDParams{
+		GroupID:       group.ID,
+		IncludeSystem: false,
+	})
 	if err != nil {
 		httpapi.InternalServerError(rw, err)
 		return
@@ -165,11 +171,10 @@ func (api *API) patchGroup(rw http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		// TODO: It would be nice to enforce this at the schema level
-		// but unfortunately our org_members table does not have an ID.
 		_, err := database.ExpectOne(api.Database.OrganizationMembers(ctx, database.OrganizationMembersParams{
 			OrganizationID: group.OrganizationID,
 			UserID:         uuid.MustParse(id),
+			IncludeSystem:  false,
 		}))
 		if errors.Is(err, sql.ErrNoRows) {
 			httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
@@ -218,6 +223,7 @@ func (api *API) patchGroup(rw http.ResponseWriter, r *http.Request) {
 			updateGroupParams.Name = req.Name
 		}
 		if req.QuotaAllowance != nil {
+			// #nosec G115 - Quota allowance is small and fits in int32
 			updateGroupParams.QuotaAllowance = int32(*req.QuotaAllowance)
 		}
 		if req.DisplayName != nil {
@@ -277,7 +283,15 @@ func (api *API) patchGroup(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	patchedMembers, err := api.Database.GetGroupMembersByGroupID(ctx, group.ID)
+	org, err := api.Database.GetOrganizationByID(ctx, group.OrganizationID)
+	if err != nil {
+		httpapi.InternalServerError(rw, err)
+	}
+
+	patchedMembers, err := api.Database.GetGroupMembersByGroupID(ctx, database.GetGroupMembersByGroupIDParams{
+		GroupID:       group.ID,
+		IncludeSystem: false,
+	})
 	if err != nil {
 		httpapi.InternalServerError(rw, err)
 		return
@@ -285,7 +299,20 @@ func (api *API) patchGroup(rw http.ResponseWriter, r *http.Request) {
 
 	aReq.New = group.Auditable(patchedMembers)
 
-	httpapi.Write(ctx, rw, http.StatusOK, db2sdk.Group(group, patchedMembers))
+	memberCount, err := api.Database.GetGroupMembersCountByGroupID(ctx, database.GetGroupMembersCountByGroupIDParams{
+		GroupID:       group.ID,
+		IncludeSystem: false,
+	})
+	if err != nil {
+		httpapi.InternalServerError(rw, err)
+		return
+	}
+
+	httpapi.Write(ctx, rw, http.StatusOK, db2sdk.Group(database.GetGroupsRow{
+		Group:                   group,
+		OrganizationName:        org.Name,
+		OrganizationDisplayName: org.DisplayName,
+	}, patchedMembers, int(memberCount)))
 }
 
 // @Summary Delete group by name
@@ -318,7 +345,10 @@ func (api *API) deleteGroup(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	groupMembers, getMembersErr := api.Database.GetGroupMembersByGroupID(ctx, group.ID)
+	groupMembers, getMembersErr := api.Database.GetGroupMembersByGroupID(ctx, database.GetGroupMembersByGroupIDParams{
+		GroupID:       group.ID,
+		IncludeSystem: false,
+	})
 	if getMembersErr != nil {
 		httpapi.InternalServerError(rw, getMembersErr)
 		return
@@ -364,13 +394,34 @@ func (api *API) group(rw http.ResponseWriter, r *http.Request) {
 		group = httpmw.GroupParam(r)
 	)
 
-	users, err := api.Database.GetGroupMembersByGroupID(ctx, group.ID)
+	org, err := api.Database.GetOrganizationByID(ctx, group.OrganizationID)
+	if err != nil {
+		httpapi.InternalServerError(rw, err)
+	}
+
+	users, err := api.Database.GetGroupMembersByGroupID(ctx, database.GetGroupMembersByGroupIDParams{
+		GroupID:       group.ID,
+		IncludeSystem: false,
+	})
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		httpapi.InternalServerError(rw, err)
 		return
 	}
 
-	httpapi.Write(ctx, rw, http.StatusOK, db2sdk.Group(group, users))
+	memberCount, err := api.Database.GetGroupMembersCountByGroupID(ctx, database.GetGroupMembersCountByGroupIDParams{
+		GroupID:       group.ID,
+		IncludeSystem: false,
+	})
+	if err != nil {
+		httpapi.InternalServerError(rw, err)
+		return
+	}
+
+	httpapi.Write(ctx, rw, http.StatusOK, db2sdk.Group(database.GetGroupsRow{
+		Group:                   group,
+		OrganizationName:        org.Name,
+		OrganizationDisplayName: org.DisplayName,
+	}, users, int(memberCount)))
 }
 
 // @Summary Get groups by organization
@@ -382,40 +433,95 @@ func (api *API) group(rw http.ResponseWriter, r *http.Request) {
 // @Success 200 {array} codersdk.Group
 // @Router /organizations/{organization}/groups [get]
 func (api *API) groupsByOrganization(rw http.ResponseWriter, r *http.Request) {
+	org := httpmw.OrganizationParam(r)
+
+	values := r.URL.Query()
+	values.Set("organization", org.ID.String())
+	r.URL.RawQuery = values.Encode()
+
 	api.groups(rw, r)
 }
 
+// @Summary Get groups
+// @ID get-groups
+// @Security CoderSessionToken
+// @Produce json
+// @Tags Enterprise
+// @Param organization query string true "Organization ID or name"
+// @Param has_member query string true "User ID or name"
+// @Param group_ids query string true "Comma separated list of group IDs"
+// @Success 200 {array} codersdk.Group
+// @Router /groups [get]
 func (api *API) groups(rw http.ResponseWriter, r *http.Request) {
-	var (
-		ctx = r.Context()
-		org = httpmw.OrganizationParam(r)
-	)
+	ctx := r.Context()
 
-	groups, err := api.Database.GetGroupsByOrganizationID(ctx, org.ID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		httpapi.InternalServerError(rw, err)
+	var filter database.GetGroupsParams
+	parser := httpapi.NewQueryParamParser()
+	// Organization selector can be an org ID or name
+	filter.OrganizationID = parser.UUIDorName(r.URL.Query(), uuid.Nil, "organization", func(orgName string) (uuid.UUID, error) {
+		org, err := api.Database.GetOrganizationByName(ctx, database.GetOrganizationByNameParams{
+			Name:    orgName,
+			Deleted: false,
+		})
+		if err != nil {
+			return uuid.Nil, xerrors.Errorf("organization %q not found", orgName)
+		}
+		return org.ID, nil
+	})
+
+	// has_member selector can be a user ID or username
+	filter.HasMemberID = parser.UUIDorName(r.URL.Query(), uuid.Nil, "has_member", func(username string) (uuid.UUID, error) {
+		user, err := api.Database.GetUserByEmailOrUsername(ctx, database.GetUserByEmailOrUsernameParams{
+			Username: username,
+			Email:    "",
+		})
+		if err != nil {
+			return uuid.Nil, xerrors.Errorf("user %q not found", username)
+		}
+		return user.ID, nil
+	})
+
+	filter.GroupIds = parser.UUIDs(r.URL.Query(), []uuid.UUID{}, "group_ids")
+
+	parser.ErrorExcessParams(r.URL.Query())
+	if len(parser.Errors) > 0 {
+		httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
+			Message:     "Query parameters have invalid values.",
+			Validations: parser.Errors,
+		})
 		return
 	}
 
-	// Filter groups based on rbac permissions
-	groups, err = coderd.AuthorizeFilter(api.AGPL.HTTPAuth, r, policy.ActionRead, groups)
+	groups, err := api.Database.GetGroups(ctx, filter)
+	if httpapi.Is404Error(err) {
+		httpapi.ResourceNotFound(rw)
+		return
+	}
 	if err != nil {
-		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-			Message: "Internal error fetching groups.",
-			Detail:  err.Error(),
-		})
+		httpapi.InternalServerError(rw, err)
 		return
 	}
 
 	resp := make([]codersdk.Group, 0, len(groups))
 	for _, group := range groups {
-		members, err := api.Database.GetGroupMembersByGroupID(ctx, group.ID)
+		members, err := api.Database.GetGroupMembersByGroupID(ctx, database.GetGroupMembersByGroupIDParams{
+			GroupID:       group.Group.ID,
+			IncludeSystem: false,
+		})
+		if err != nil {
+			httpapi.InternalServerError(rw, err)
+			return
+		}
+		memberCount, err := api.Database.GetGroupMembersCountByGroupID(ctx, database.GetGroupMembersCountByGroupIDParams{
+			GroupID:       group.Group.ID,
+			IncludeSystem: false,
+		})
 		if err != nil {
 			httpapi.InternalServerError(rw, err)
 			return
 		}
 
-		resp = append(resp, db2sdk.Group(group, members))
+		resp = append(resp, db2sdk.Group(group, members, int(memberCount)))
 	}
 
 	httpapi.Write(ctx, rw, http.StatusOK, resp)

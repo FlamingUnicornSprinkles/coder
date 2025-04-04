@@ -12,9 +12,20 @@ import (
 
 	"github.com/coder/coder/v2/cli/clitest"
 	"github.com/coder/coder/v2/coderd/coderdtest"
+	"github.com/coder/coder/v2/coderd/notifications"
+	"github.com/coder/coder/v2/coderd/notifications/notificationstest"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/testutil"
 )
+
+func createOpts(t *testing.T) *coderdtest.Options {
+	t.Helper()
+
+	dt := coderdtest.DeploymentValues(t)
+	return &coderdtest.Options{
+		DeploymentValues: dt,
+	}
+}
 
 func TestNotifications(t *testing.T) {
 	t.Parallel()
@@ -42,7 +53,7 @@ func TestNotifications(t *testing.T) {
 			t.Parallel()
 
 			// given
-			ownerClient, db := coderdtest.NewWithDatabase(t, nil)
+			ownerClient, db := coderdtest.NewWithDatabase(t, createOpts(t))
 			_ = coderdtest.CreateFirstUser(t, ownerClient)
 
 			// when
@@ -72,7 +83,7 @@ func TestPauseNotifications_RegularUser(t *testing.T) {
 	t.Parallel()
 
 	// given
-	ownerClient, db := coderdtest.NewWithDatabase(t, nil)
+	ownerClient, db := coderdtest.NewWithDatabase(t, createOpts(t))
 	owner := coderdtest.CreateFirstUser(t, ownerClient)
 	anotherClient, _ := coderdtest.CreateAnotherUser(t, ownerClient, owner.OrganizationID)
 
@@ -87,7 +98,7 @@ func TestPauseNotifications_RegularUser(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorAsf(t, err, &sdkError, "error should be of type *codersdk.Error")
 	assert.Equal(t, http.StatusForbidden, sdkError.StatusCode())
-	assert.Contains(t, sdkError.Message, "Insufficient permissions to update notifications settings.")
+	assert.Contains(t, sdkError.Message, "Forbidden.")
 
 	// then
 	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
@@ -99,4 +110,60 @@ func TestPauseNotifications_RegularUser(t *testing.T) {
 	err = json.Unmarshal([]byte(settingsJSON), &settings)
 	require.NoError(t, err)
 	require.False(t, settings.NotifierPaused) // still running
+}
+
+func TestNotificationsTest(t *testing.T) {
+	t.Parallel()
+
+	t.Run("OwnerCanSendTestNotification", func(t *testing.T) {
+		t.Parallel()
+
+		notifyEnq := &notificationstest.FakeEnqueuer{}
+
+		// Given: An owner user.
+		ownerClient := coderdtest.New(t, &coderdtest.Options{
+			DeploymentValues:      coderdtest.DeploymentValues(t),
+			NotificationsEnqueuer: notifyEnq,
+		})
+		_ = coderdtest.CreateFirstUser(t, ownerClient)
+
+		// When: The owner user attempts to send the test notification.
+		inv, root := clitest.New(t, "notifications", "test")
+		clitest.SetupConfig(t, ownerClient, root)
+
+		// Then: we expect a notification to be sent.
+		err := inv.Run()
+		require.NoError(t, err)
+
+		sent := notifyEnq.Sent(notificationstest.WithTemplateID(notifications.TemplateTestNotification))
+		require.Len(t, sent, 1)
+	})
+
+	t.Run("MemberCannotSendTestNotification", func(t *testing.T) {
+		t.Parallel()
+
+		notifyEnq := &notificationstest.FakeEnqueuer{}
+
+		// Given: A member user.
+		ownerClient := coderdtest.New(t, &coderdtest.Options{
+			DeploymentValues:      coderdtest.DeploymentValues(t),
+			NotificationsEnqueuer: notifyEnq,
+		})
+		ownerUser := coderdtest.CreateFirstUser(t, ownerClient)
+		memberClient, _ := coderdtest.CreateAnotherUser(t, ownerClient, ownerUser.OrganizationID)
+
+		// When: The member user attempts to send the test notification.
+		inv, root := clitest.New(t, "notifications", "test")
+		clitest.SetupConfig(t, memberClient, root)
+
+		// Then: we expect an error and no notifications to be sent.
+		err := inv.Run()
+		var sdkError *codersdk.Error
+		require.Error(t, err)
+		require.ErrorAsf(t, err, &sdkError, "error should be of type *codersdk.Error")
+		assert.Equal(t, http.StatusForbidden, sdkError.StatusCode())
+
+		sent := notifyEnq.Sent(notificationstest.WithTemplateID(notifications.TemplateTestNotification))
+		require.Len(t, sent, 0)
+	})
 }

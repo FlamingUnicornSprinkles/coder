@@ -32,10 +32,13 @@ func (api *API) postJFrogXrayScan(rw http.ResponseWriter, r *http.Request) {
 	err := api.Database.UpsertJFrogXrayScanByWorkspaceAndAgentID(ctx, database.UpsertJFrogXrayScanByWorkspaceAndAgentIDParams{
 		WorkspaceID: req.WorkspaceID,
 		AgentID:     req.AgentID,
-		Critical:    int32(req.Critical),
-		High:        int32(req.High),
-		Medium:      int32(req.Medium),
-		ResultsUrl:  req.ResultsURL,
+		// #nosec G115 - Vulnerability counts are small and fit in int32
+		Critical: int32(req.Critical),
+		// #nosec G115 - Vulnerability counts are small and fit in int32
+		High: int32(req.High),
+		// #nosec G115 - Vulnerability counts are small and fit in int32
+		Medium:     int32(req.Medium),
+		ResultsUrl: req.ResultsURL,
 	})
 	if httpapi.Is404Error(err) {
 		httpapi.ResourceNotFound(rw)
@@ -104,14 +107,10 @@ func (api *API) jFrogXrayScan(rw http.ResponseWriter, r *http.Request) {
 
 func (api *API) jfrogEnabledMW(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		api.entitlementsMu.RLock()
 		// This doesn't actually use the external auth feature but we want
 		// to lock this behind an enterprise license and it's somewhat
 		// related to external auth (in that it is JFrog integration).
-		enabled := api.entitlements.Features[codersdk.FeatureMultipleExternalAuth].Enabled
-		api.entitlementsMu.RUnlock()
-
-		if !enabled {
+		if !api.Entitlements.Enabled(codersdk.FeatureMultipleExternalAuth) {
 			httpapi.RouteNotFound(rw)
 			return
 		}

@@ -7,6 +7,7 @@ import (
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
+
 	"github.com/coder/coder/v2/coderd/database"
 )
 
@@ -19,7 +20,7 @@ func Rotate(ctx context.Context, log slog.Logger, sqlDB *sql.DB, ciphers []Ciphe
 		return xerrors.Errorf("create cryptdb: %w", err)
 	}
 
-	userIDs, err := db.AllUserIDs(ctx)
+	userIDs, err := db.AllUserIDs(ctx, false)
 	if err != nil {
 		return xerrors.Errorf("get users: %w", err)
 	}
@@ -43,7 +44,7 @@ func Rotate(ctx context.Context, log slog.Logger, sqlDB *sql.DB, ciphers []Ciphe
 					OAuthExpiry:            userLink.OAuthExpiry,
 					UserID:                 uid,
 					LoginType:              userLink.LoginType,
-					DebugContext:           userLink.DebugContext,
+					Claims:                 userLink.Claims,
 				}); err != nil {
 					return xerrors.Errorf("update user link user_id=%s linked_id=%s: %w", userLink.UserID, userLink.LinkedID, err)
 				}
@@ -73,7 +74,7 @@ func Rotate(ctx context.Context, log slog.Logger, sqlDB *sql.DB, ciphers []Ciphe
 				}
 			}
 			return nil
-		}, &sql.TxOptions{
+		}, &database.TxOptions{
 			Isolation: sql.LevelRepeatableRead,
 		})
 		if err != nil {
@@ -109,7 +110,7 @@ func Decrypt(ctx context.Context, log slog.Logger, sqlDB *sql.DB, ciphers []Ciph
 	}
 	cryptDB.primaryCipherDigest = ""
 
-	userIDs, err := db.AllUserIDs(ctx)
+	userIDs, err := db.AllUserIDs(ctx, false)
 	if err != nil {
 		return xerrors.Errorf("get users: %w", err)
 	}
@@ -133,7 +134,7 @@ func Decrypt(ctx context.Context, log slog.Logger, sqlDB *sql.DB, ciphers []Ciph
 					OAuthExpiry:            userLink.OAuthExpiry,
 					UserID:                 uid,
 					LoginType:              userLink.LoginType,
-					DebugContext:           userLink.DebugContext,
+					Claims:                 userLink.Claims,
 				}); err != nil {
 					return xerrors.Errorf("update user link user_id=%s linked_id=%s: %w", userLink.UserID, userLink.LinkedID, err)
 				}
@@ -163,7 +164,7 @@ func Decrypt(ctx context.Context, log slog.Logger, sqlDB *sql.DB, ciphers []Ciph
 				}
 			}
 			return nil
-		}, &sql.TxOptions{
+		}, &database.TxOptions{
 			Isolation: sql.LevelRepeatableRead,
 		})
 		if err != nil {

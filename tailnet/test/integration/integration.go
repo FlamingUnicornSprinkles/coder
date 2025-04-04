@@ -26,7 +26,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/xerrors"
-	"nhooyr.io/websocket"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/tailcfg"
@@ -40,6 +39,7 @@ import (
 	"github.com/coder/coder/v2/tailnet"
 	tailnetproto "github.com/coder/coder/v2/tailnet/proto"
 	"github.com/coder/coder/v2/testutil"
+	"github.com/coder/websocket"
 )
 
 type ClientNumber int
@@ -181,6 +181,7 @@ func (o SimpleServerOptions) Router(t *testing.T, logger slog.Logger) *chi.Mux {
 			}
 		},
 		NetworkTelemetryHandler: func(batch []*tailnetproto.TelemetryEvent) {},
+		ResumeTokenProvider:     tailnet.NewInsecureTestResumeTokenProvider(),
 	})
 	require.NoError(t, err)
 
@@ -372,7 +373,7 @@ http {
 // and creates a tailnet.Conn which will only use DERP to connect to the peer.
 func StartClientDERP(t *testing.T, logger slog.Logger, serverURL *url.URL, derpMap *tailcfg.DERPMap, me, peer Client) *tailnet.Conn {
 	return startClientOptions(t, logger, serverURL, me, peer, &tailnet.Options{
-		Addresses:           []netip.Prefix{netip.PrefixFrom(tailnet.IPFromUUID(me.ID), 128)},
+		Addresses:           []netip.Prefix{tailnet.TailscaleServicePrefix.PrefixFromUUID(me.ID)},
 		DERPMap:             derpMap,
 		BlockEndpoints:      true,
 		Logger:              logger,
@@ -388,7 +389,7 @@ func StartClientDERP(t *testing.T, logger slog.Logger, serverURL *url.URL, derpM
 // only use DERP WebSocket fallback.
 func StartClientDERPWebSockets(t *testing.T, logger slog.Logger, serverURL *url.URL, derpMap *tailcfg.DERPMap, me, peer Client) *tailnet.Conn {
 	return startClientOptions(t, logger, serverURL, me, peer, &tailnet.Options{
-		Addresses:           []netip.Prefix{netip.PrefixFrom(tailnet.IPFromUUID(me.ID), 128)},
+		Addresses:           []netip.Prefix{tailnet.TailscaleServicePrefix.PrefixFromUUID(me.ID)},
 		DERPMap:             derpMap,
 		BlockEndpoints:      true,
 		Logger:              logger,
@@ -405,7 +406,7 @@ func StartClientDERPWebSockets(t *testing.T, logger slog.Logger, serverURL *url.
 // connection to be established between the two peers.
 func StartClientDirect(t *testing.T, logger slog.Logger, serverURL *url.URL, derpMap *tailcfg.DERPMap, me, peer Client) *tailnet.Conn {
 	conn := startClientOptions(t, logger, serverURL, me, peer, &tailnet.Options{
-		Addresses:           []netip.Prefix{netip.PrefixFrom(tailnet.IPFromUUID(me.ID), 128)},
+		Addresses:           []netip.Prefix{tailnet.TailscaleServicePrefix.PrefixFromUUID(me.ID)},
 		DERPMap:             derpMap,
 		BlockEndpoints:      false,
 		Logger:              logger,
@@ -417,7 +418,7 @@ func StartClientDirect(t *testing.T, logger slog.Logger, serverURL *url.URL, der
 	})
 
 	// Wait for direct connection to be established.
-	peerIP := tailnet.IPFromUUID(peer.ID)
+	peerIP := tailnet.TailscaleServicePrefix.AddrFromUUID(peer.ID)
 	require.Eventually(t, func() bool {
 		t.Log("attempting ping to peer to judge direct connection")
 		ctx := testutil.Context(t, testutil.WaitShort)
@@ -466,9 +467,13 @@ func startClientOptions(t *testing.T, logger slog.Logger, serverURL *url.URL, me
 		_ = conn.Close()
 	})
 
-	coordination := tailnet.NewRemoteCoordination(logger, coord, conn, peer.ID)
+	ctrl := tailnet.NewTunnelSrcCoordController(logger, conn)
+	ctrl.AddDestination(peer.ID)
+	coordination := ctrl.New(coord)
 	t.Cleanup(func() {
-		_ = coordination.Close()
+		cctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
+		defer cancel()
+		_ = coordination.Close(cctx)
 	})
 
 	return conn
@@ -587,7 +592,7 @@ func ExecBackground(t *testing.T, processName string, netNS *os.File, name strin
 		select {
 		case err := <-waitErr:
 			if err != nil {
-				t.Logf("subprocess exited: " + err.Error())
+				t.Log("subprocess exited: " + err.Error())
 			}
 			return
 		default:

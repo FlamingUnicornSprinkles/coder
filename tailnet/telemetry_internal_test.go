@@ -18,7 +18,7 @@ func TestTelemetryStore(t *testing.T) {
 	t.Run("CreateEvent", func(t *testing.T) {
 		t.Parallel()
 
-		remotePrefix := netip.PrefixFrom(IP(), 128)
+		remotePrefix := TailscaleServicePrefix.RandomPrefix()
 		remoteIP := remotePrefix.Addr()
 		application := "test"
 
@@ -31,16 +31,16 @@ func TestTelemetryStore(t *testing.T) {
 				{
 					ID: 1,
 					Addresses: []netip.Prefix{
-						netip.PrefixFrom(IP(), 128),
-						netip.PrefixFrom(IP(), 128),
+						TailscaleServicePrefix.RandomPrefix(),
+						TailscaleServicePrefix.RandomPrefix(),
 					},
 				},
 				{
 					ID: 2,
 					Addresses: []netip.Prefix{
 						remotePrefix,
-						netip.PrefixFrom(IP(), 128),
-						netip.PrefixFrom(IP(), 128),
+						TailscaleServicePrefix.RandomPrefix(),
+						TailscaleServicePrefix.RandomPrefix(),
 					},
 				},
 			},
@@ -70,7 +70,9 @@ func TestTelemetryStore(t *testing.T) {
 		e := telemetry.newEvent()
 		// DERPMapToProto already tested
 		require.Equal(t, DERPMapToProto(nm.DERPMap), e.DerpMap)
+		// #nosec G115 - Safe conversion in test code as node IDs are within uint64 range
 		require.Equal(t, uint64(nm.Peers[1].ID), e.NodeIdRemote)
+		// #nosec G115 - Safe conversion in test code as node IDs are within uint64 range
 		require.Equal(t, uint64(nm.SelfNode.ID), e.NodeIdSelf)
 		require.Equal(t, application, e.Application)
 		require.Equal(t, nm.SelfNode.DERP, fmt.Sprintf("127.3.3.40:%d", e.HomeDerp))

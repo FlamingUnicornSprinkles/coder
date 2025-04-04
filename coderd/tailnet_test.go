@@ -20,8 +20,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"tailscale.com/tailcfg"
 
-	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/agent"
 	"github.com/coder/coder/v2/agent/agenttest"
 	"github.com/coder/coder/v2/agent/proto"
@@ -186,7 +184,9 @@ func TestServerTailnet_ReverseProxy(t *testing.T) {
 		// Ensure the reverse proxy director rewrites the url host to the agent's IP.
 		rp.Director(req)
 		assert.Equal(t,
-			fmt.Sprintf("[%s]:%d", tailnet.IPFromUUID(a.id).String(), workspacesdk.AgentHTTPAPIServerPort),
+			fmt.Sprintf("[%s]:%d",
+				tailnet.TailscaleServicePrefix.AddrFromUUID(a.id).String(),
+				workspacesdk.AgentHTTPAPIServerPort),
 			req.URL.Host,
 		)
 	})
@@ -390,13 +390,15 @@ type agentWithID struct {
 }
 
 func setupServerTailnetAgent(t *testing.T, agentNum int, opts ...tailnettest.DERPAndStunOption) ([]agentWithID, *coderd.ServerTailnet) {
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	derpMap, derpServer := tailnettest.RunDERPAndSTUN(t, opts...)
 
 	coord := tailnet.NewCoordinator(logger)
 	t.Cleanup(func() {
 		_ = coord.Close()
 	})
+	coordPtr := atomic.Pointer[tailnet.Coordinator]{}
+	coordPtr.Store(&coord)
 
 	agents := []agentWithID{}
 
@@ -428,13 +430,18 @@ func setupServerTailnetAgent(t *testing.T, agentNum int, opts ...tailnettest.DER
 		agents = append(agents, agentWithID{id: manifest.AgentID, Agent: ag})
 	}
 
+	dialer := &coderd.InmemTailnetDialer{
+		CoordPtr: &coordPtr,
+		DERPFn:   func() *tailcfg.DERPMap { return derpMap },
+		Logger:   logger,
+		ClientID: uuid.UUID{5},
+	}
 	serverTailnet, err := coderd.NewServerTailnet(
 		context.Background(),
 		logger,
 		derpServer,
-		func() *tailcfg.DERPMap { return derpMap },
+		dialer,
 		false,
-		func(context.Context) (tailnet.MultiAgentConn, error) { return coord.ServeMultiAgent(uuid.New()), nil },
 		!derpMap.HasSTUN(),
 		trace.NewNoopTracerProvider(),
 	)

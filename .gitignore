@@ -17,6 +17,8 @@ yarn-error.log
 # Allow VSCode recommendations and default settings in project root.
 !/.vscode/extensions.json
 !/.vscode/settings.json
+# Allow code snippets
+!/.vscode/*.code-snippets
 
 # Front-end ignore patterns.
 .next/
@@ -30,10 +32,12 @@ site/e2e/.auth.json
 site/playwright-report/*
 site/.swc
 
-# Make target for updating golden files (any dir).
+# Make target for updating generated/golden files (any dir).
+.gen
 .gen-golden
 
 # Build
+bin/
 build/
 dist/
 out/
@@ -52,6 +56,7 @@ site/stats/
 
 # direnv
 .envrc
+.direnv
 *.test
 
 # Loadtesting
@@ -71,3 +76,6 @@ result
 
 # pnpm
 .pnpm-store/
+
+# Zed
+.zed_server

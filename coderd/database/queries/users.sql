@@ -11,7 +11,9 @@ SET
 		'':: bytea
 	END
 WHERE
-	id = @user_id RETURNING *;
+	id = @user_id
+	AND NOT is_system
+RETURNING *;
 
 -- name: GetUserByID :one
 SELECT
@@ -46,7 +48,8 @@ SELECT
 FROM
 	users
 WHERE
-	deleted = false;
+	deleted = false
+  	AND CASE WHEN @include_system::bool THEN TRUE ELSE is_system = false END;
 
 -- name: GetActiveUserCount :one
 SELECT
@@ -54,7 +57,8 @@ SELECT
 FROM
 	users
 WHERE
-	status = 'active'::user_status AND deleted = false;
+	status = 'active'::user_status AND deleted = false
+	AND CASE WHEN @include_system::bool THEN TRUE ELSE is_system = false END;
 
 -- name: InsertUser :one
 INSERT INTO
@@ -67,10 +71,15 @@ INSERT INTO
 		created_at,
 		updated_at,
 		rbac_roles,
-		login_type
+		login_type,
+		status
 	)
 VALUES
-	($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *;
+	($1, $2, $3, $4, $5, $6, $7, $8, $9,
+		-- if the status passed in is empty, fallback to dormant, which is what
+		-- we were doing before.
+		COALESCE(NULLIF(@status::text, '')::user_status, 'dormant'::user_status)
+	) RETURNING *;
 
 -- name: UpdateUserProfile :one
 UPDATE
@@ -85,14 +94,35 @@ WHERE
 	id = $1
 RETURNING *;
 
--- name: UpdateUserAppearanceSettings :one
+-- name: UpdateUserGithubComUserID :exec
 UPDATE
 	users
 SET
-	theme_preference = $2,
-	updated_at = $3
+	github_com_user_id = $2
 WHERE
-	id = $1
+	id = $1;
+
+-- name: GetUserAppearanceSettings :one
+SELECT
+	value as theme_preference
+FROM
+	user_configs
+WHERE
+	user_id = @user_id
+	AND key = 'theme_preference';
+
+-- name: UpdateUserAppearanceSettings :one
+INSERT INTO
+	user_configs (user_id, key, value)
+VALUES
+	(@user_id, 'theme_preference', @theme_preference)
+ON CONFLICT
+	ON CONSTRAINT user_configs_pkey
+DO UPDATE
+SET
+	value = @theme_preference
+WHERE user_configs.user_id = @user_id
+	AND user_configs.key = 'theme_preference'
 RETURNING *;
 
 -- name: UpdateUserRoles :one
@@ -109,7 +139,9 @@ RETURNING *;
 UPDATE
 	users
 SET
-	hashed_password = $2
+	hashed_password = $2,
+	hashed_one_time_passcode = NULL,
+	one_time_passcode_expires_at = NULL
 WHERE
 	id = $1;
 
@@ -182,6 +214,27 @@ WHERE
 	AND CASE
 		WHEN @last_seen_after :: timestamp with time zone != '0001-01-01 00:00:00Z' THEN
 			last_seen_at >= @last_seen_after
+		ELSE true
+	END
+	-- Filter by created_at
+	AND CASE
+		WHEN @created_before :: timestamp with time zone != '0001-01-01 00:00:00Z' THEN
+			created_at <= @created_before
+		ELSE true
+	END
+	AND CASE
+		WHEN @created_after :: timestamp with time zone != '0001-01-01 00:00:00Z' THEN
+			created_at >= @created_after
+		ELSE true
+	END
+  	AND CASE
+  	    WHEN @include_system::bool THEN TRUE
+  	    ELSE
+			is_system = false
+	END
+	AND CASE
+		WHEN @github_com_user_id :: bigint != 0 THEN
+			github_com_user_id = @github_com_user_id
 		ELSE true
 	END
 	-- End of filters
@@ -272,12 +325,24 @@ UPDATE
     users
 SET
     status = 'dormant'::user_status,
-	updated_at = @updated_at
+    updated_at = @updated_at
 WHERE
     last_seen_at < @last_seen_after :: timestamp
     AND status = 'active'::user_status
-RETURNING id, email, last_seen_at;
+		AND NOT is_system
+RETURNING id, email, username, last_seen_at;
 
 -- AllUserIDs returns all UserIDs regardless of user status or deletion.
 -- name: AllUserIDs :many
-SELECT DISTINCT id FROM USERS;
+SELECT DISTINCT id FROM USERS
+	WHERE CASE WHEN @include_system::bool THEN TRUE ELSE is_system = false END;
+
+-- name: UpdateUserHashedOneTimePasscode :exec
+UPDATE
+    users
+SET
+    hashed_one_time_passcode = $2,
+    one_time_passcode_expires_at = $3
+WHERE
+    id = $1
+;

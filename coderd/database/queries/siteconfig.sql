@@ -71,6 +71,13 @@ SELECT value FROM site_configs WHERE key = 'oauth_signing_key';
 INSERT INTO site_configs (key, value) VALUES ('oauth_signing_key', $1)
 ON CONFLICT (key) DO UPDATE set value = $1 WHERE site_configs.key = 'oauth_signing_key';
 
+-- name: GetCoordinatorResumeTokenSigningKey :one
+SELECT value FROM site_configs WHERE key = 'coordinator_resume_token_signing_key';
+
+-- name: UpsertCoordinatorResumeTokenSigningKey :exec
+INSERT INTO site_configs (key, value) VALUES ('coordinator_resume_token_signing_key', $1)
+ON CONFLICT (key) DO UPDATE set value = $1 WHERE site_configs.key = 'coordinator_resume_token_signing_key';
+
 -- name: GetHealthSettings :one
 SELECT
 	COALESCE((SELECT value FROM site_configs WHERE key = 'health_settings'), '{}') :: text AS health_settings
@@ -89,3 +96,51 @@ SELECT
 INSERT INTO site_configs (key, value) VALUES ('notifications_settings', $1)
 ON CONFLICT (key) DO UPDATE SET value = $1 WHERE site_configs.key = 'notifications_settings';
 
+-- name: GetRuntimeConfig :one
+SELECT value FROM site_configs WHERE site_configs.key = $1;
+
+-- name: UpsertRuntimeConfig :exec
+INSERT INTO site_configs (key, value) VALUES ($1, $2)
+ON CONFLICT (key) DO UPDATE SET value = $2 WHERE site_configs.key = $1;
+
+-- name: DeleteRuntimeConfig :exec
+DELETE FROM site_configs
+WHERE site_configs.key = $1;
+
+-- name: GetOAuth2GithubDefaultEligible :one
+SELECT
+	CASE
+		WHEN value = 'true' THEN TRUE
+		ELSE FALSE
+	END
+FROM site_configs
+WHERE key = 'oauth2_github_default_eligible';
+
+-- name: UpsertOAuth2GithubDefaultEligible :exec
+INSERT INTO site_configs (key, value)
+VALUES (
+    'oauth2_github_default_eligible',
+    CASE
+        WHEN sqlc.arg(eligible)::bool THEN 'true'
+        ELSE 'false'
+    END
+)
+ON CONFLICT (key) DO UPDATE
+SET value = CASE
+    WHEN sqlc.arg(eligible)::bool THEN 'true'
+    ELSE 'false'
+END
+WHERE site_configs.key = 'oauth2_github_default_eligible';
+
+-- name: UpsertWebpushVAPIDKeys :exec
+INSERT INTO site_configs (key, value)
+VALUES
+    ('webpush_vapid_public_key', @vapid_public_key :: text),
+    ('webpush_vapid_private_key', @vapid_private_key :: text)
+ON CONFLICT (key)
+DO UPDATE SET value = EXCLUDED.value WHERE site_configs.key = EXCLUDED.key;
+
+-- name: GetWebpushVAPIDKeys :one
+SELECT
+    COALESCE((SELECT value FROM site_configs WHERE key = 'webpush_vapid_public_key'), '') :: text AS vapid_public_key,
+    COALESCE((SELECT value FROM site_configs WHERE key = 'webpush_vapid_private_key'), '') :: text AS vapid_private_key;

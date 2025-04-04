@@ -11,7 +11,6 @@ package tailnettest
 
 import (
 	context "context"
-	net "net"
 	http "net/http"
 	reflect "reflect"
 
@@ -25,6 +24,7 @@ import (
 type MockCoordinator struct {
 	ctrl     *gomock.Controller
 	recorder *MockCoordinatorMockRecorder
+	isgomock struct{}
 }
 
 // MockCoordinatorMockRecorder is the mock recorder for MockCoordinator.
@@ -59,84 +59,42 @@ func (mr *MockCoordinatorMockRecorder) Close() *gomock.Call {
 }
 
 // Coordinate mocks base method.
-func (m *MockCoordinator) Coordinate(arg0 context.Context, arg1 uuid.UUID, arg2 string, arg3 tailnet.CoordinateeAuth) (chan<- *proto.CoordinateRequest, <-chan *proto.CoordinateResponse) {
+func (m *MockCoordinator) Coordinate(ctx context.Context, id uuid.UUID, name string, a tailnet.CoordinateeAuth) (chan<- *proto.CoordinateRequest, <-chan *proto.CoordinateResponse) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Coordinate", arg0, arg1, arg2, arg3)
+	ret := m.ctrl.Call(m, "Coordinate", ctx, id, name, a)
 	ret0, _ := ret[0].(chan<- *proto.CoordinateRequest)
 	ret1, _ := ret[1].(<-chan *proto.CoordinateResponse)
 	return ret0, ret1
 }
 
 // Coordinate indicates an expected call of Coordinate.
-func (mr *MockCoordinatorMockRecorder) Coordinate(arg0, arg1, arg2, arg3 any) *gomock.Call {
+func (mr *MockCoordinatorMockRecorder) Coordinate(ctx, id, name, a any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Coordinate", reflect.TypeOf((*MockCoordinator)(nil).Coordinate), arg0, arg1, arg2, arg3)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Coordinate", reflect.TypeOf((*MockCoordinator)(nil).Coordinate), ctx, id, name, a)
 }
 
 // Node mocks base method.
-func (m *MockCoordinator) Node(arg0 uuid.UUID) *tailnet.Node {
+func (m *MockCoordinator) Node(id uuid.UUID) *tailnet.Node {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Node", arg0)
+	ret := m.ctrl.Call(m, "Node", id)
 	ret0, _ := ret[0].(*tailnet.Node)
 	return ret0
 }
 
 // Node indicates an expected call of Node.
-func (mr *MockCoordinatorMockRecorder) Node(arg0 any) *gomock.Call {
+func (mr *MockCoordinatorMockRecorder) Node(id any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Node", reflect.TypeOf((*MockCoordinator)(nil).Node), arg0)
-}
-
-// ServeAgent mocks base method.
-func (m *MockCoordinator) ServeAgent(arg0 net.Conn, arg1 uuid.UUID, arg2 string) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ServeAgent", arg0, arg1, arg2)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// ServeAgent indicates an expected call of ServeAgent.
-func (mr *MockCoordinatorMockRecorder) ServeAgent(arg0, arg1, arg2 any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ServeAgent", reflect.TypeOf((*MockCoordinator)(nil).ServeAgent), arg0, arg1, arg2)
-}
-
-// ServeClient mocks base method.
-func (m *MockCoordinator) ServeClient(arg0 net.Conn, arg1, arg2 uuid.UUID) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ServeClient", arg0, arg1, arg2)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// ServeClient indicates an expected call of ServeClient.
-func (mr *MockCoordinatorMockRecorder) ServeClient(arg0, arg1, arg2 any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ServeClient", reflect.TypeOf((*MockCoordinator)(nil).ServeClient), arg0, arg1, arg2)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Node", reflect.TypeOf((*MockCoordinator)(nil).Node), id)
 }
 
 // ServeHTTPDebug mocks base method.
-func (m *MockCoordinator) ServeHTTPDebug(arg0 http.ResponseWriter, arg1 *http.Request) {
+func (m *MockCoordinator) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "ServeHTTPDebug", arg0, arg1)
+	m.ctrl.Call(m, "ServeHTTPDebug", w, r)
 }
 
 // ServeHTTPDebug indicates an expected call of ServeHTTPDebug.
-func (mr *MockCoordinatorMockRecorder) ServeHTTPDebug(arg0, arg1 any) *gomock.Call {
+func (mr *MockCoordinatorMockRecorder) ServeHTTPDebug(w, r any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ServeHTTPDebug", reflect.TypeOf((*MockCoordinator)(nil).ServeHTTPDebug), arg0, arg1)
-}
-
-// ServeMultiAgent mocks base method.
-func (m *MockCoordinator) ServeMultiAgent(arg0 uuid.UUID) tailnet.MultiAgentConn {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ServeMultiAgent", arg0)
-	ret0, _ := ret[0].(tailnet.MultiAgentConn)
-	return ret0
-}
-
-// ServeMultiAgent indicates an expected call of ServeMultiAgent.
-func (mr *MockCoordinatorMockRecorder) ServeMultiAgent(arg0 any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ServeMultiAgent", reflect.TypeOf((*MockCoordinator)(nil).ServeMultiAgent), arg0)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ServeHTTPDebug", reflect.TypeOf((*MockCoordinator)(nil).ServeHTTPDebug), w, r)
 }

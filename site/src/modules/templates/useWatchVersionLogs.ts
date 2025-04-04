@@ -1,42 +1,38 @@
-import { useState, useEffect } from "react";
 import { watchBuildLogsByTemplateVersionId } from "api/api";
 import type { ProvisionerJobLog, TemplateVersion } from "api/typesGenerated";
+import { useEffectEvent } from "hooks/hookPolyfills";
+import { useEffect, useState } from "react";
 
 export const useWatchVersionLogs = (
-  templateVersion: TemplateVersion | undefined,
-  options?: { onDone: () => Promise<unknown> },
+	templateVersion: TemplateVersion | undefined,
+	options?: { onDone: () => Promise<unknown> },
 ) => {
-  const [logs, setLogs] = useState<ProvisionerJobLog[] | undefined>();
-  const templateVersionId = templateVersion?.id;
-  const templateVersionStatus = templateVersion?.job.status;
+	const [logs, setLogs] = useState<ProvisionerJobLog[]>();
+	const templateVersionId = templateVersion?.id;
+	const [cachedVersionId, setCachedVersionId] = useState(templateVersionId);
+	if (cachedVersionId !== templateVersionId) {
+		setCachedVersionId(templateVersionId);
+		setLogs([]);
+	}
 
-  useEffect(() => {
-    setLogs(undefined);
-  }, [templateVersionId]);
+	const stableOnDone = useEffectEvent(() => options?.onDone());
+	const status = templateVersion?.job.status;
+	const canWatch = status === "running" || status === "pending";
+	useEffect(() => {
+		if (!templateVersionId || !canWatch) {
+			return;
+		}
 
-  useEffect(() => {
-    if (!templateVersionId || !templateVersionStatus) {
-      return;
-    }
+		const socket = watchBuildLogsByTemplateVersionId(templateVersionId, {
+			onError: (error) => console.error(error),
+			onDone: stableOnDone,
+			onMessage: (newLog) => {
+				setLogs((current) => [...(current ?? []), newLog]);
+			},
+		});
 
-    if (templateVersionStatus !== "running") {
-      return;
-    }
+		return () => socket.close();
+	}, [stableOnDone, canWatch, templateVersionId]);
 
-    const socket = watchBuildLogsByTemplateVersionId(templateVersionId, {
-      onMessage: (log) => {
-        setLogs((logs) => (logs ? [...logs, log] : [log]));
-      },
-      onDone: options?.onDone,
-      onError: (error) => {
-        console.error(error);
-      },
-    });
-
-    return () => {
-      socket.close();
-    };
-  }, [options?.onDone, templateVersionId, templateVersionStatus]);
-
-  return logs;
+	return logs;
 };

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/notifications"
+	"github.com/coder/coder/v2/coderd/notifications/notificationstest"
 	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/coderd/util/ptr"
 	"github.com/coder/coder/v2/codersdk"
@@ -38,9 +40,11 @@ func TestTemplates(t *testing.T) {
 	t.Run("Deprecated", func(t *testing.T) {
 		t.Parallel()
 
+		notifyEnq := &notificationstest.FakeEnqueuer{}
 		owner, user := coderdenttest.New(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				IncludeProvisionerDaemon: true,
+				NotificationsEnqueuer:    notifyEnq,
 			},
 			LicenseOptions: &coderdenttest.LicenseOptions{
 				Features: license.Features{
@@ -48,10 +52,23 @@ func TestTemplates(t *testing.T) {
 				},
 			},
 		})
-		client, _ := coderdtest.CreateAnotherUser(t, owner, user.OrganizationID, rbac.RoleTemplateAdmin())
+		client, secondUser := coderdtest.CreateAnotherUser(t, owner, user.OrganizationID, rbac.RoleTemplateAdmin())
+		otherClient, otherUser := coderdtest.CreateAnotherUser(t, owner, user.OrganizationID, rbac.RoleTemplateAdmin())
+
 		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
 		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
+
+		_ = coderdtest.CreateWorkspace(t, owner, template.ID)
+		_ = coderdtest.CreateWorkspace(t, client, template.ID)
+
+		// Create another template for testing that users of another template do not
+		// get a notification.
+		secondVersion := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
+		secondTemplate := coderdtest.CreateTemplate(t, client, user.OrganizationID, secondVersion.ID)
+		coderdtest.AwaitTemplateVersionJobCompleted(t, client, secondVersion.ID)
+
+		_ = coderdtest.CreateWorkspace(t, otherClient, secondTemplate.ID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
@@ -64,6 +81,32 @@ func TestTemplates(t *testing.T) {
 		// AGPL cannot deprecate, expect no change
 		assert.True(t, updated.Deprecated)
 		assert.NotEmpty(t, updated.DeprecationMessage)
+
+		notifs := []*notificationstest.FakeNotification{}
+		for _, notif := range notifyEnq.Sent() {
+			if notif.TemplateID == notifications.TemplateTemplateDeprecated {
+				notifs = append(notifs, notif)
+			}
+		}
+		require.Equal(t, 2, len(notifs))
+
+		expectedSentTo := []string{user.UserID.String(), secondUser.ID.String()}
+		slices.Sort(expectedSentTo)
+
+		sentTo := []string{}
+		for _, notif := range notifs {
+			sentTo = append(sentTo, notif.UserID.String())
+		}
+		slices.Sort(sentTo)
+
+		// Require the notification to have only been sent to the expected users
+		assert.Equal(t, expectedSentTo, sentTo)
+
+		// The previous check should verify this but we're double checking that
+		// the notification wasn't sent to users not using the template.
+		for _, notif := range notifs {
+			assert.NotEqual(t, otherUser.ID, notif.UserID)
+		}
 
 		_, err = client.CreateWorkspace(ctx, user.OrganizationID, codersdk.Me, codersdk.CreateWorkspaceRequest{
 			TemplateID: template.ID,
@@ -118,11 +161,11 @@ func TestTemplates(t *testing.T) {
 							Name: "some",
 							Type: "example",
 							Agents: []*proto.Agent{{
-								Id: "something",
+								Id:   "something",
+								Name: "test",
 								Auth: &proto.Agent_Token{
 									Token: uuid.NewString(),
 								},
-								Name: "test",
 							}},
 						}, {
 							Name: "another",
@@ -132,7 +175,10 @@ func TestTemplates(t *testing.T) {
 				},
 			}},
 		})
-		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
+		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID, func(ctr *codersdk.CreateTemplateRequest) {
+			ctr.MaxPortShareLevel = ptr.Ref(codersdk.WorkspaceAgentPortShareLevelPublic)
+		})
+		require.Equal(t, template.MaxPortShareLevel, codersdk.WorkspaceAgentPortShareLevelPublic)
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		ws := coderdtest.CreateWorkspace(t, client, template.ID)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, ws.LatestBuild.ID)
@@ -643,7 +689,7 @@ func TestTemplates(t *testing.T) {
 		client, user := coderdenttest.New(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				IncludeProvisionerDaemon: true,
-				TemplateScheduleStore:    schedule.NewEnterpriseTemplateScheduleStore(agplUserQuietHoursScheduleStore(), notifications.NewNoopEnqueuer(), logger),
+				TemplateScheduleStore:    schedule.NewEnterpriseTemplateScheduleStore(agplUserQuietHoursScheduleStore(), notifications.NewNoopEnqueuer(), logger, nil),
 			},
 			LicenseOptions: &coderdenttest.LicenseOptions{
 				Features: license.Features{
@@ -693,7 +739,7 @@ func TestTemplates(t *testing.T) {
 		owner, first := coderdenttest.New(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				IncludeProvisionerDaemon: true,
-				TemplateScheduleStore:    schedule.NewEnterpriseTemplateScheduleStore(agplUserQuietHoursScheduleStore(), notifications.NewNoopEnqueuer(), logger),
+				TemplateScheduleStore:    schedule.NewEnterpriseTemplateScheduleStore(agplUserQuietHoursScheduleStore(), notifications.NewNoopEnqueuer(), logger, nil),
 			},
 			LicenseOptions: &coderdenttest.LicenseOptions{
 				Features: license.Features{
@@ -729,7 +775,6 @@ func TestTemplates(t *testing.T) {
 		t.Parallel()
 
 		dv := coderdtest.DeploymentValues(t)
-		dv.Experiments = []string{string(codersdk.ExperimentCustomRoles), string(codersdk.ExperimentMultiOrganization)}
 		ownerClient, _ := coderdenttest.New(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues:         dv,
@@ -751,7 +796,7 @@ func TestTemplates(t *testing.T) {
 		})
 
 		//nolint:gocritic // owner required to make custom roles
-		orgTemplateAdminRole, err := ownerClient.PatchOrganizationRole(ctx, secondOrg.ID, codersdk.Role{
+		orgTemplateAdminRole, err := ownerClient.CreateOrganizationRole(ctx, codersdk.Role{
 			Name:           "org-template-admin",
 			OrganizationID: secondOrg.ID.String(),
 			OrganizationPermissions: codersdk.CreatePermissions(map[codersdk.RBACResource][]codersdk.RBACAction{
@@ -779,7 +824,6 @@ func TestTemplates(t *testing.T) {
 	t.Run("MultipleOrganizations", func(t *testing.T) {
 		t.Parallel()
 		dv := coderdtest.DeploymentValues(t)
-		dv.Experiments = []string{string(codersdk.ExperimentMultiOrganization)}
 		ownerClient, owner := coderdenttest.New(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues: dv,
@@ -878,6 +922,7 @@ func TestTemplateACL(t *testing.T) {
 
 	t.Run("everyoneGroup", func(t *testing.T) {
 		t.Parallel()
+
 		client, user := coderdenttest.New(t, &coderdenttest.Options{LicenseOptions: &coderdenttest.LicenseOptions{
 			Features: license.Features{
 				codersdk.FeatureTemplateRBAC: 1,
@@ -896,7 +941,7 @@ func TestTemplateACL(t *testing.T) {
 		require.NoError(t, err)
 
 		require.Len(t, acl.Groups, 1)
-		require.Len(t, acl.Groups[0].Members, 2)
+		require.Len(t, acl.Groups[0].Members, 2) // orgAdmin + TemplateAdmin
 		require.Len(t, acl.Users, 0)
 	})
 
@@ -1020,6 +1065,46 @@ func TestTemplateACL(t *testing.T) {
 		acl, err = anotherClient.TemplateACL(ctx, template.ID)
 		require.NoError(t, err)
 		require.Len(t, acl.Users, 0, "deleted users should be filtered")
+	})
+
+	// Test that we do not filter dormant users.
+	t.Run("IncludeDormantUsers", func(t *testing.T) {
+		t.Parallel()
+
+		client, user := coderdenttest.New(t, &coderdenttest.Options{LicenseOptions: &coderdenttest.LicenseOptions{
+			Features: license.Features{
+				codersdk.FeatureTemplateRBAC: 1,
+			},
+		}})
+		anotherClient, _ := coderdtest.CreateAnotherUser(t, client, user.OrganizationID, rbac.RoleTemplateAdmin(), rbac.RoleUserAdmin())
+
+		ctx := testutil.Context(t, testutil.WaitLong)
+
+		// nolint:gocritic // Must use owner to create user.
+		user1, err := client.CreateUserWithOrgs(ctx, codersdk.CreateUserRequestWithOrgs{
+			Email:           "coder@coder.com",
+			Username:        "coder",
+			Password:        "SomeStrongPassword!",
+			OrganizationIDs: []uuid.UUID{user.OrganizationID},
+		})
+		require.NoError(t, err)
+		require.Equal(t, codersdk.UserStatusDormant, user1.Status)
+		version := coderdtest.CreateTemplateVersion(t, client, user.OrganizationID, nil)
+		template := coderdtest.CreateTemplate(t, client, user.OrganizationID, version.ID)
+
+		err = anotherClient.UpdateTemplateACL(ctx, template.ID, codersdk.UpdateTemplateACL{
+			UserPerms: map[string]codersdk.TemplateRole{
+				user1.ID.String(): codersdk.TemplateRoleUse,
+			},
+		})
+		require.NoError(t, err)
+
+		acl, err := anotherClient.TemplateACL(ctx, template.ID)
+		require.NoError(t, err)
+		require.Contains(t, acl.Users, codersdk.TemplateUser{
+			User: user1,
+			Role: codersdk.TemplateRoleUse,
+		})
 	})
 
 	// Test that we do not return suspended users.
@@ -1453,6 +1538,10 @@ func TestUpdateTemplateACL(t *testing.T) {
 			},
 		}
 
+		// Group adds complexity to the /available endpoint
+		// Intentionally omit user2
+		coderdtest.CreateGroup(t, client, user.OrganizationID, "some-group", user3)
+
 		ctx := testutil.Context(t, testutil.WaitLong)
 
 		err := client1.UpdateTemplateACL(ctx, template.ID, req)
@@ -1692,7 +1781,6 @@ func TestTemplateAccess(t *testing.T) {
 	t.Cleanup(cancel)
 
 	dv := coderdtest.DeploymentValues(t)
-	dv.Experiments = []string{string(codersdk.ExperimentMultiOrganization)}
 	ownerClient, owner := coderdenttest.New(t, &coderdenttest.Options{
 		Options: &coderdtest.Options{
 			DeploymentValues: dv,
@@ -1903,7 +1991,6 @@ func TestMultipleOrganizationTemplates(t *testing.T) {
 	t.Parallel()
 
 	dv := coderdtest.DeploymentValues(t)
-	dv.Experiments = []string{string(codersdk.ExperimentMultiOrganization)}
 	ownerClient, first := coderdenttest.New(t, &coderdenttest.Options{
 		Options: &coderdtest.Options{
 			// This only affects the first org.
@@ -1932,7 +2019,7 @@ func TestMultipleOrganizationTemplates(t *testing.T) {
 	t.Logf("Second organization: %s", second.ID.String())
 	t.Logf("Third organization: %s", third.ID.String())
 
-	t.Logf("Creating template version in second organization")
+	t.Log("Creating template version in second organization")
 
 	start := time.Now()
 	version := coderdtest.CreateTemplateVersion(t, templateAdmin, second.ID, nil)

@@ -15,6 +15,8 @@ USAGE:
 
 SUBCOMMANDS:
     autoupdate        Toggle auto-update policy for a workspace
+    completion        Install or update shell completion scripts for the
+                      detected or chosen shell.
     config-ssh        Add an SSH Host entry for your workspaces "ssh
                       coder.workspace"
     create            Create a workspace
@@ -29,9 +31,11 @@ SUBCOMMANDS:
     netcheck          Print network debug information for DERP and STUN
     notifications     Manage Coder notifications
     open              Open a workspace
+    organizations     Organization related commands
     ping              Ping a workspace
     port-forward      Forward ports from a workspace to the local machine. For
                       reverse port forwarding, use "coder ssh -R".
+    provisioner       View and manage provisioner daemons and jobs
     publickey         Output your Coder public key used for Git operations
     rename            Rename a workspace
     reset-password    Directly connect to the database to reset a user's
@@ -74,6 +78,9 @@ variables or flags.
           server. If telemetry is also enabled on the server, it may be sent to
           Coder. Network telemetry is used to measure network quality and detect
           regressions.
+
+      --force-tty bool, $CODER_FORCE_TTY
+          Force the use of a TTY.
 
       --global-config string, $CODER_CONFIG_DIR (default: ~/.config/coderv2)
           Path to the global `coder` config directory.

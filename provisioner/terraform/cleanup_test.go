@@ -18,7 +18,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/provisioner/terraform"
 	"github.com/coder/coder/v2/testutil"
 )
@@ -41,7 +40,7 @@ func TestPluginCache_Golden(t *testing.T) {
 		// afero.MemMapFs does not modify atimes, so use a real FS instead.
 		tmpDir := t.TempDir()
 		fs := afero.NewBasePathFs(afero.NewOsFs(), tmpDir)
-		logger := slogtest.Make(t, nil).
+		logger := testutil.Logger(t).
 			Leveled(slog.LevelDebug).
 			Named("cleanup-test")
 		return fs, logger
@@ -175,8 +174,8 @@ func diffFileSystem(t *testing.T, fs afero.Fs) {
 	}
 
 	want, err := os.ReadFile(goldenFile)
-	require.NoError(t, err, "open golden file, run \"make update-golden-files\" and commit the changes")
-	assert.Empty(t, cmp.Diff(want, actual), "golden file mismatch (-want +got): %s, run \"make update-golden-files\", verify and commit the changes", goldenFile)
+	require.NoError(t, err, "open golden file, run \"make gen/golden-files\" and commit the changes")
+	assert.Empty(t, cmp.Diff(want, actual), "golden file mismatch (-want +got): %s, run \"make gen/golden-files\", verify and commit the changes", goldenFile)
 }
 
 func dumpFileSystem(t *testing.T, fs afero.Fs) []byte {

@@ -22,6 +22,8 @@ pn = "pn"
 EDE = "EDE"
 # HELO is an SMTP command
 HELO = "HELO"
+LKE = "LKE"
+byt = "byt"
 
 [files]
 extend-exclude = [
@@ -33,11 +35,12 @@ extend-exclude = [
 	# These files contain base64 strings that confuse the detector
 	"**XService**.ts",
 	"**identity.go",
-	"scripts/ci-report/testdata/**",
 	"**/*_test.go",
 	"**/*.test.tsx",
 	"**/pnpm-lock.yaml",
 	"tailnet/testdata/**",
 	"site/src/pages/SetupPage/countries.tsx",
 	"provisioner/terraform/testdata/**",
+	# notifications' golden files confuse the detector because of quoted-printable encoding
+	"coderd/notifications/testdata/**"
 ]

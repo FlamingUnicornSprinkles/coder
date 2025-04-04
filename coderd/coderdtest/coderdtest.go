@@ -33,6 +33,7 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/fullsailor/pkcs7"
+	"github.com/go-chi/chi/v5"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/google/uuid"
 	"github.com/moby/moby/pkg/namesgenerator"
@@ -51,10 +52,13 @@ import (
 	"cdr.dev/slog"
 	"cdr.dev/slog/sloggers/sloghuman"
 	"cdr.dev/slog/sloggers/slogtest"
+	"github.com/coder/quartz"
+
 	"github.com/coder/coder/v2/coderd"
 	"github.com/coder/coder/v2/coderd/audit"
 	"github.com/coder/coder/v2/coderd/autobuild"
 	"github.com/coder/coder/v2/coderd/awsidentity"
+	"github.com/coder/coder/v2/coderd/cryptokeys"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/db2sdk"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
@@ -65,12 +69,16 @@ import (
 	"github.com/coder/coder/v2/coderd/gitsshkey"
 	"github.com/coder/coder/v2/coderd/httpmw"
 	"github.com/coder/coder/v2/coderd/notifications"
+	"github.com/coder/coder/v2/coderd/notifications/notificationstest"
 	"github.com/coder/coder/v2/coderd/rbac"
+	"github.com/coder/coder/v2/coderd/rbac/policy"
+	"github.com/coder/coder/v2/coderd/runtimeconfig"
 	"github.com/coder/coder/v2/coderd/schedule"
 	"github.com/coder/coder/v2/coderd/telemetry"
 	"github.com/coder/coder/v2/coderd/unhanger"
 	"github.com/coder/coder/v2/coderd/updatecheck"
 	"github.com/coder/coder/v2/coderd/util/ptr"
+	"github.com/coder/coder/v2/coderd/webpush"
 	"github.com/coder/coder/v2/coderd/workspaceapps"
 	"github.com/coder/coder/v2/coderd/workspaceapps/appurl"
 	"github.com/coder/coder/v2/coderd/workspacestats"
@@ -88,33 +96,30 @@ import (
 	"github.com/coder/coder/v2/testutil"
 )
 
-// AppSecurityKey is a 96-byte key used to sign JWTs and encrypt JWEs for
-// workspace app tokens in tests.
-var AppSecurityKey = must(workspaceapps.KeyFromString("6465616e207761732068657265206465616e207761732068657265206465616e207761732068657265206465616e207761732068657265206465616e207761732068657265206465616e207761732068657265206465616e2077617320686572"))
-
 type Options struct {
 	// AccessURL denotes a custom access URL. By default we use the httptest
 	// server's URL. Setting this may result in unexpected behavior (especially
 	// with running agents).
-	AccessURL             *url.URL
-	AppHostname           string
-	AWSCertificates       awsidentity.Certificates
-	Authorizer            rbac.Authorizer
-	AzureCertificates     x509.VerifyOptions
-	GithubOAuth2Config    *coderd.GithubOAuth2Config
-	RealIPConfig          *httpmw.RealIPConfig
-	OIDCConfig            *coderd.OIDCConfig
-	GoogleTokenValidator  *idtoken.Validator
-	SSHKeygenAlgorithm    gitsshkey.Algorithm
-	AutobuildTicker       <-chan time.Time
-	AutobuildStats        chan<- autobuild.Stats
-	Auditor               audit.Auditor
-	TLSCertificates       []tls.Certificate
-	ExternalAuthConfigs   []*externalauth.Config
-	TrialGenerator        func(ctx context.Context, body codersdk.LicensorTrialRequest) error
-	RefreshEntitlements   func(ctx context.Context) error
-	TemplateScheduleStore schedule.TemplateScheduleStore
-	Coordinator           tailnet.Coordinator
+	AccessURL                      *url.URL
+	AppHostname                    string
+	AWSCertificates                awsidentity.Certificates
+	Authorizer                     rbac.Authorizer
+	AzureCertificates              x509.VerifyOptions
+	GithubOAuth2Config             *coderd.GithubOAuth2Config
+	RealIPConfig                   *httpmw.RealIPConfig
+	OIDCConfig                     *coderd.OIDCConfig
+	GoogleTokenValidator           *idtoken.Validator
+	SSHKeygenAlgorithm             gitsshkey.Algorithm
+	AutobuildTicker                <-chan time.Time
+	AutobuildStats                 chan<- autobuild.Stats
+	Auditor                        audit.Auditor
+	TLSCertificates                []tls.Certificate
+	ExternalAuthConfigs            []*externalauth.Config
+	TrialGenerator                 func(ctx context.Context, body codersdk.LicensorTrialRequest) error
+	RefreshEntitlements            func(ctx context.Context) error
+	TemplateScheduleStore          schedule.TemplateScheduleStore
+	Coordinator                    tailnet.Coordinator
+	CoordinatorResumeTokenProvider tailnet.ResumeTokenProvider
 
 	HealthcheckFunc    func(ctx context.Context, apiKey string) *healthsdk.HealthcheckReport
 	HealthcheckTimeout time.Duration
@@ -124,6 +129,9 @@ type Options struct {
 	APIRateLimit   int
 	LoginRateLimit int
 	FilesRateLimit int
+
+	// OneTimePasscodeValidityPeriod specifies how long a one time passcode should be valid for.
+	OneTimePasscodeValidityPeriod time.Duration
 
 	// IncludeProvisionerDaemon when true means to start an in-memory provisionerD
 	IncludeProvisionerDaemon    bool
@@ -141,6 +149,11 @@ type Options struct {
 	Database database.Store
 	Pubsub   pubsub.Pubsub
 
+	// APIMiddleware inserts middleware before api.RootHandler, this can be
+	// useful in certain tests where you want to intercept requests before
+	// passing them on to the API, e.g. for synchronization of execution.
+	APIMiddleware func(http.Handler) http.Handler
+
 	ConfigSSH codersdk.SSHConfigResponse
 
 	SwaggerEndpoint bool
@@ -149,14 +162,18 @@ type Options struct {
 	Logger       *slog.Logger
 	StatsBatcher workspacestats.Batcher
 
+	WebpushDispatcher                  webpush.Dispatcher
 	WorkspaceAppsStatsCollectorOptions workspaceapps.StatsCollectorOptions
 	AllowWorkspaceRenames              bool
 	NewTicker                          func(duration time.Duration) (<-chan time.Time, func())
 	DatabaseRolluper                   *dbrollup.Rolluper
 	WorkspaceUsageTrackerFlush         chan int
 	WorkspaceUsageTrackerTick          chan time.Time
-
-	NotificationsEnqueuer notifications.Enqueuer
+	NotificationsEnqueuer              notifications.Enqueuer
+	APIKeyEncryptionCache              cryptokeys.EncryptionKeycache
+	OIDCConvertKeyCache                cryptokeys.SigningKeycache
+	Clock                              quartz.Clock
+	TelemetryReporter                  telemetry.Reporter
 }
 
 // New constructs a codersdk client connected to an in-memory API instance.
@@ -204,7 +221,7 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 		options = &Options{}
 	}
 	if options.Logger == nil {
-		logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug).Named("coderd")
+		logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true}).Leveled(slog.LevelDebug).Named("coderd")
 		options.Logger = &logger
 	}
 	if options.GoogleTokenValidator == nil {
@@ -240,15 +257,19 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 	if options.Database == nil {
 		options.Database, options.Pubsub = dbtestutil.NewDB(t)
 	}
+	if options.CoordinatorResumeTokenProvider == nil {
+		options.CoordinatorResumeTokenProvider = tailnet.NewInsecureTestResumeTokenProvider()
+	}
 
 	if options.NotificationsEnqueuer == nil {
-		options.NotificationsEnqueuer = new(testutil.FakeNotificationsEnqueuer)
+		options.NotificationsEnqueuer = &notificationstest.FakeEnqueuer{}
 	}
 
 	accessControlStore := &atomic.Pointer[dbauthz.AccessControlStore]{}
 	var acs dbauthz.AccessControlStore = dbauthz.AGPLTemplateAccessControlStore{}
 	accessControlStore.Store(&acs)
 
+	runtimeManager := runtimeconfig.NewManager()
 	options.Database = dbauthz.New(options.Database, options.Authorizer, *options.Logger, accessControlStore)
 
 	// Some routes expect a deployment ID, so just make sure one exists.
@@ -261,11 +282,31 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 		require.NoError(t, err, "insert a deployment id")
 	}
 
+	if options.WebpushDispatcher == nil {
+		// nolint:gocritic // Gets/sets VAPID keys.
+		pushNotifier, err := webpush.New(dbauthz.AsNotifier(context.Background()), options.Logger, options.Database, "http://example.com")
+		if err != nil {
+			panic(xerrors.Errorf("failed to create web push notifier: %w", err))
+		}
+		options.WebpushDispatcher = pushNotifier
+	}
+
 	if options.DeploymentValues == nil {
 		options.DeploymentValues = DeploymentValues(t)
 	}
-	// This value is not safe to run in parallel. Force it to be false.
-	options.DeploymentValues.DisableOwnerWorkspaceExec = false
+	// DisableOwnerWorkspaceExec modifies the 'global' RBAC roles. Fast-fail tests if we detect this.
+	if !options.DeploymentValues.DisableOwnerWorkspaceExec.Value() {
+		ownerSubj := rbac.Subject{
+			Roles: rbac.RoleIdentifiers{rbac.RoleOwner()},
+			Scope: rbac.ScopeAll,
+		}
+		if err := options.Authorizer.Authorize(context.Background(), ownerSubj, policy.ActionSSH, rbac.ResourceWorkspace); err != nil {
+			if rbac.IsUnauthorizedError(err) {
+				t.Fatal("Side-effect of DisableOwnerWorkspaceExec detected in unrelated test. Please move the test that requires DisableOwnerWorkspaceExec to its own package so that it does not impact other tests!")
+			}
+			require.NoError(t, err)
+		}
+	}
 
 	// If no ratelimits are set, disable all rate limiting for tests.
 	if options.APIRateLimit == 0 {
@@ -290,7 +331,11 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 		t.Cleanup(closeBatcher)
 	}
 	if options.NotificationsEnqueuer == nil {
-		options.NotificationsEnqueuer = &testutil.FakeNotificationsEnqueuer{}
+		options.NotificationsEnqueuer = &notificationstest.FakeEnqueuer{}
+	}
+
+	if options.OneTimePasscodeValidityPeriod == 0 {
+		options.OneTimePasscodeValidityPeriod = testutil.WaitLong
 	}
 
 	var templateScheduleStore atomic.Pointer[schedule.TemplateScheduleStore]
@@ -310,6 +355,7 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 		ctx,
 		options.Database,
 		options.Pubsub,
+		prometheus.NewRegistry(),
 		&templateScheduleStore,
 		&auditor,
 		accessControlStore,
@@ -324,6 +370,10 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 	hangDetector := unhanger.New(ctx, options.Database, options.Pubsub, options.Logger.Named("unhanger.detector"), hangDetectorTicker.C)
 	hangDetector.Start()
 	t.Cleanup(hangDetector.Close)
+
+	if options.TelemetryReporter == nil {
+		options.TelemetryReporter = telemetry.NewNoop()
+	}
 
 	// Did last_used_at not update? Scratching your noggin? Here's why.
 	// Workspace usage tracking must be triggered manually in tests.
@@ -466,6 +516,7 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 			AppHostnameRegex:               appHostnameRegex,
 			Logger:                         *options.Logger,
 			CacheDir:                       t.TempDir(),
+			RuntimeConfig:                  runtimeManager,
 			Database:                       options.Database,
 			Pubsub:                         options.Pubsub,
 			ExternalAuthConfigs:            options.ExternalAuthConfigs,
@@ -483,22 +534,23 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 			LoginRateLimit:                     options.LoginRateLimit,
 			FilesRateLimit:                     options.FilesRateLimit,
 			Authorizer:                         options.Authorizer,
-			Telemetry:                          telemetry.NewNoop(),
+			Telemetry:                          options.TelemetryReporter,
 			TemplateScheduleStore:              &templateScheduleStore,
 			AccessControlStore:                 accessControlStore,
 			TLSCertificates:                    options.TLSCertificates,
 			TrialGenerator:                     options.TrialGenerator,
 			RefreshEntitlements:                options.RefreshEntitlements,
 			TailnetCoordinator:                 options.Coordinator,
+			WebPushDispatcher:                  options.WebpushDispatcher,
 			BaseDERPMap:                        derpMap,
 			DERPMapUpdateFrequency:             150 * time.Millisecond,
+			CoordinatorResumeTokenProvider:     options.CoordinatorResumeTokenProvider,
 			MetricsCacheRefreshInterval:        options.MetricsCacheRefreshInterval,
 			AgentStatsRefreshInterval:          options.AgentStatsRefreshInterval,
 			DeploymentValues:                   options.DeploymentValues,
 			DeploymentOptions:                  codersdk.DeploymentOptionsWithoutSecrets(options.DeploymentValues.Options()),
 			UpdateCheckOptions:                 options.UpdateCheckOptions,
 			SwaggerEndpoint:                    options.SwaggerEndpoint,
-			AppSecurityKey:                     AppSecurityKey,
 			SSHConfig:                          options.ConfigSSH,
 			HealthcheckFunc:                    options.HealthcheckFunc,
 			HealthcheckTimeout:                 options.HealthcheckTimeout,
@@ -510,6 +562,10 @@ func NewOptions(t testing.TB, options *Options) (func(http.Handler), context.Can
 			DatabaseRolluper:                   options.DatabaseRolluper,
 			WorkspaceUsageTracker:              wuTracker,
 			NotificationsEnqueuer:              options.NotificationsEnqueuer,
+			OneTimePasscodeValidityPeriod:      options.OneTimePasscodeValidityPeriod,
+			Clock:                              options.Clock,
+			AppEncryptionKeyCache:              options.APIKeyEncryptionCache,
+			OIDCConvertKeyCache:                options.OIDCConvertKeyCache,
 		}
 }
 
@@ -523,7 +579,14 @@ func NewWithAPI(t testing.TB, options *Options) (*codersdk.Client, io.Closer, *c
 	setHandler, cancelFunc, serverURL, newOptions := NewOptions(t, options)
 	// We set the handler after server creation for the access URL.
 	coderAPI := coderd.New(newOptions)
-	setHandler(coderAPI.RootHandler)
+	rootHandler := coderAPI.RootHandler
+	if options.APIMiddleware != nil {
+		r := chi.NewRouter()
+		r.Use(options.APIMiddleware)
+		r.Mount("/", rootHandler)
+		rootHandler = r
+	}
+	setHandler(rootHandler)
 	var provisionerCloser io.Closer = nopcloser{}
 	if options.IncludeProvisionerDaemon {
 		provisionerCloser = NewTaggedProvisionerDaemon(t, coderAPI, "test", options.ProvisionerDaemonTags)
@@ -599,6 +662,7 @@ func NewTaggedProvisionerDaemon(t testing.TB, coderAPI *coderd.API, name string,
 		assert.NoError(t, err)
 	}()
 
+	connectedCh := make(chan struct{})
 	daemon := provisionerd.New(func(dialCtx context.Context) (provisionerdproto.DRPCProvisionerDaemonClient, error) {
 		return coderAPI.CreateInMemoryTaggedProvisionerDaemon(dialCtx, name, []codersdk.ProvisionerType{codersdk.ProvisionerTypeEcho}, provisionerTags)
 	}, &provisionerd.Options{
@@ -608,7 +672,12 @@ func NewTaggedProvisionerDaemon(t testing.TB, coderAPI *coderd.API, name string,
 		Connector: provisionerd.LocalProvisioners{
 			string(database.ProvisionerTypeEcho): sdkproto.NewDRPCProvisionerClient(echoClient),
 		},
+		InitConnectionCh: connectedCh,
 	})
+	// Wait for the provisioner daemon to connect before continuing.
+	// Users of this function tend to assume that the provisioner is connected
+	// and ready to use when that may not strictly be the case.
+	<-connectedCh
 	closer := NewProvisionerDaemonCloser(daemon)
 	t.Cleanup(func() {
 		_ = closer.Close()
@@ -621,6 +690,16 @@ var FirstUserParams = codersdk.CreateFirstUserRequest{
 	Username: "testuser",
 	Password: "SomeSecurePassword!",
 	Name:     "Test User",
+}
+
+var TrialUserParams = codersdk.CreateFirstUserTrialInfo{
+	FirstName:   "John",
+	LastName:    "Doe",
+	PhoneNumber: "9999999999",
+	JobTitle:    "Engineer",
+	CompanyName: "Acme Inc",
+	Country:     "United States",
+	Developers:  "10-50",
 }
 
 // CreateFirstUser creates a user with preset credentials and authenticates
@@ -641,11 +720,11 @@ func CreateFirstUser(t testing.TB, client *codersdk.Client) codersdk.CreateFirst
 // CreateAnotherUser creates and authenticates a new user.
 // Roles can include org scoped roles with 'roleName:<organization_id>'
 func CreateAnotherUser(t testing.TB, client *codersdk.Client, organizationID uuid.UUID, roles ...rbac.RoleIdentifier) (*codersdk.Client, codersdk.User) {
-	return createAnotherUserRetry(t, client, organizationID, 5, roles)
+	return createAnotherUserRetry(t, client, []uuid.UUID{organizationID}, 5, roles)
 }
 
-func CreateAnotherUserMutators(t testing.TB, client *codersdk.Client, organizationID uuid.UUID, roles []rbac.RoleIdentifier, mutators ...func(r *codersdk.CreateUserRequest)) (*codersdk.Client, codersdk.User) {
-	return createAnotherUserRetry(t, client, organizationID, 5, roles, mutators...)
+func CreateAnotherUserMutators(t testing.TB, client *codersdk.Client, organizationID uuid.UUID, roles []rbac.RoleIdentifier, mutators ...func(r *codersdk.CreateUserRequestWithOrgs)) (*codersdk.Client, codersdk.User) {
+	return createAnotherUserRetry(t, client, []uuid.UUID{organizationID}, 5, roles, mutators...)
 }
 
 // AuthzUserSubject does not include the user's groups.
@@ -671,31 +750,34 @@ func AuthzUserSubject(user codersdk.User, orgID uuid.UUID) rbac.Subject {
 	}
 }
 
-func createAnotherUserRetry(t testing.TB, client *codersdk.Client, organizationID uuid.UUID, retries int, roles []rbac.RoleIdentifier, mutators ...func(r *codersdk.CreateUserRequest)) (*codersdk.Client, codersdk.User) {
-	req := codersdk.CreateUserRequest{
-		Email:          namesgenerator.GetRandomName(10) + "@coder.com",
-		Username:       RandomUsername(t),
-		Name:           RandomName(t),
-		Password:       "SomeSecurePassword!",
-		OrganizationID: organizationID,
+func createAnotherUserRetry(t testing.TB, client *codersdk.Client, organizationIDs []uuid.UUID, retries int, roles []rbac.RoleIdentifier, mutators ...func(r *codersdk.CreateUserRequestWithOrgs)) (*codersdk.Client, codersdk.User) {
+	req := codersdk.CreateUserRequestWithOrgs{
+		Email:           namesgenerator.GetRandomName(10) + "@coder.com",
+		Username:        RandomUsername(t),
+		Name:            RandomName(t),
+		Password:        "SomeSecurePassword!",
+		OrganizationIDs: organizationIDs,
+		// Always create users as active in tests to ignore an extra audit log
+		// when logging in.
+		UserStatus: ptr.Ref(codersdk.UserStatusActive),
 	}
 	for _, m := range mutators {
 		m(&req)
 	}
 
-	user, err := client.CreateUser(context.Background(), req)
+	user, err := client.CreateUserWithOrgs(context.Background(), req)
 	var apiError *codersdk.Error
 	// If the user already exists by username or email conflict, try again up to "retries" times.
 	if err != nil && retries >= 0 && xerrors.As(err, &apiError) {
 		if apiError.StatusCode() == http.StatusConflict {
 			retries--
-			return createAnotherUserRetry(t, client, organizationID, retries, roles)
+			return createAnotherUserRetry(t, client, organizationIDs, retries, roles)
 		}
 	}
 	require.NoError(t, err)
 
 	var sessionToken string
-	if req.DisableLogin || req.UserLoginType == codersdk.LoginTypeNone {
+	if req.UserLoginType == codersdk.LoginTypeNone {
 		// Cannot log in with a disabled login user. So make it an api key from
 		// the client making this user.
 		token, err := client.CreateToken(context.Background(), user.ID.String(), codersdk.CreateTokenRequest{
@@ -758,8 +840,9 @@ func createAnotherUserRetry(t testing.TB, client *codersdk.Client, organizationI
 		require.NoError(t, err, "update site roles")
 
 		// isMember keeps track of which orgs the user was added to as a member
-		isMember := map[uuid.UUID]bool{
-			organizationID: true,
+		isMember := make(map[uuid.UUID]bool)
+		for _, orgID := range organizationIDs {
+			isMember[orgID] = true
 		}
 
 		// Update org roles
@@ -1122,8 +1205,8 @@ func MustWorkspace(t testing.TB, client *codersdk.Client, workspaceID uuid.UUID)
 
 // RequestExternalAuthCallback makes a request with the proper OAuth2 state cookie
 // to the external auth callback endpoint.
-func RequestExternalAuthCallback(t testing.TB, providerID string, client *codersdk.Client) *http.Response {
-	client.HTTPClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+func RequestExternalAuthCallback(t testing.TB, providerID string, client *codersdk.Client, opts ...func(*http.Request)) *http.Response {
+	client.HTTPClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 	state := "somestate"
@@ -1139,6 +1222,9 @@ func RequestExternalAuthCallback(t testing.TB, providerID string, client *coders
 		Name:  codersdk.SessionTokenCookie,
 		Value: client.SessionToken(),
 	})
+	for _, opt := range opts {
+		opt(req)
+	}
 	res, err := client.HTTPClient.Do(req)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -1380,10 +1466,13 @@ func SDKError(t testing.TB, err error) *codersdk.Error {
 	return cerr
 }
 
-func DeploymentValues(t testing.TB) *codersdk.DeploymentValues {
-	var cfg codersdk.DeploymentValues
+func DeploymentValues(t testing.TB, mut ...func(*codersdk.DeploymentValues)) *codersdk.DeploymentValues {
+	cfg := &codersdk.DeploymentValues{}
 	opts := cfg.Options()
 	err := opts.SetDefaults()
 	require.NoError(t, err)
-	return &cfg
+	for _, fn := range mut {
+		fn(cfg)
+	}
+	return cfg
 }

@@ -54,9 +54,11 @@ type ReducedUser struct {
 	UpdatedAt   time.Time `json:"updated_at" table:"updated at" format:"date-time"`
 	LastSeenAt  time.Time `json:"last_seen_at" format:"date-time"`
 
-	Status          UserStatus `json:"status" table:"status" enums:"active,suspended"`
-	LoginType       LoginType  `json:"login_type"`
-	ThemePreference string     `json:"theme_preference"`
+	Status    UserStatus `json:"status" table:"status" enums:"active,suspended"`
+	LoginType LoginType  `json:"login_type"`
+	// Deprecated: this value should be retrieved from
+	// `codersdk.UserPreferenceSettings` instead.
+	ThemePreference string `json:"theme_preference,omitempty"`
 }
 
 // User represents a user in Coder.
@@ -113,6 +115,11 @@ type CreateFirstUserResponse struct {
 	OrganizationID uuid.UUID `json:"organization_id" format:"uuid"`
 }
 
+// CreateUserRequest
+// Deprecated: Use CreateUserRequestWithOrgs instead. This will be removed.
+// TODO: When removing, we should rename CreateUserRequestWithOrgs -> CreateUserRequest
+// Then alias CreateUserRequestWithOrgs to CreateUserRequest.
+// @typescript-ignore CreateUserRequest
 type CreateUserRequest struct {
 	Email    string `json:"email" validate:"required,email" format:"email"`
 	Username string `json:"username" validate:"required,username"`
@@ -127,9 +134,63 @@ type CreateUserRequest struct {
 	OrganizationID uuid.UUID `json:"organization_id" validate:"" format:"uuid"`
 }
 
+type CreateUserRequestWithOrgs struct {
+	Email    string `json:"email" validate:"required,email" format:"email"`
+	Username string `json:"username" validate:"required,username"`
+	Name     string `json:"name" validate:"user_real_name"`
+	Password string `json:"password"`
+	// UserLoginType defaults to LoginTypePassword.
+	UserLoginType LoginType `json:"login_type"`
+	// UserStatus defaults to UserStatusDormant.
+	UserStatus *UserStatus `json:"user_status"`
+	// OrganizationIDs is a list of organization IDs that the user should be a member of.
+	OrganizationIDs []uuid.UUID `json:"organization_ids" validate:"" format:"uuid"`
+}
+
+// UnmarshalJSON implements the unmarshal for the legacy param "organization_id".
+// To accommodate multiple organizations, the field has been switched to a slice.
+// The previous field will just be appended to the slice.
+// Note in the previous behavior, omitting the field would result in the
+// default org being applied, but that is no longer the case.
+// TODO: Remove this method in it's entirety after some period of time.
+// This will be released in v1.16.0, and is associated with the multiple orgs
+// feature.
+func (r *CreateUserRequestWithOrgs) UnmarshalJSON(data []byte) error {
+	// By using a type alias, we prevent an infinite recursion when unmarshalling.
+	// This allows us to use the default unmarshal behavior of the original type.
+	type AliasedReq CreateUserRequestWithOrgs
+	type DeprecatedCreateUserRequest struct {
+		AliasedReq
+		OrganizationID *uuid.UUID `json:"organization_id" format:"uuid"`
+	}
+	var dep DeprecatedCreateUserRequest
+	err := json.Unmarshal(data, &dep)
+	if err != nil {
+		return err
+	}
+	*r = CreateUserRequestWithOrgs(dep.AliasedReq)
+	if dep.OrganizationID != nil {
+		r.OrganizationIDs = append(r.OrganizationIDs, *dep.OrganizationID)
+	}
+	return nil
+}
+
 type UpdateUserProfileRequest struct {
 	Username string `json:"username" validate:"required,username"`
 	Name     string `json:"name" validate:"user_real_name"`
+}
+
+type ValidateUserPasswordRequest struct {
+	Password string `json:"password" validate:"required"`
+}
+
+type ValidateUserPasswordResponse struct {
+	Valid   bool   `json:"valid"`
+	Details string `json:"details"`
+}
+
+type UserAppearanceSettings struct {
+	ThemePreference string `json:"theme_preference"`
 }
 
 type UpdateUserAppearanceSettingsRequest struct {
@@ -199,6 +260,18 @@ type LoginWithPasswordResponse struct {
 	SessionToken string `json:"session_token" validate:"required"`
 }
 
+// RequestOneTimePasscodeRequest enables callers to request a one-time-passcode to change their password.
+type RequestOneTimePasscodeRequest struct {
+	Email string `json:"email" validate:"required,email" format:"email"`
+}
+
+// ChangePasswordWithOneTimePasscodeRequest enables callers to change their password when they've forgotten it.
+type ChangePasswordWithOneTimePasscodeRequest struct {
+	Email           string `json:"email" validate:"required,email" format:"email"`
+	Password        string `json:"password" validate:"required"`
+	OneTimePasscode string `json:"one_time_passcode" validate:"required"`
+}
+
 type OAuthConversionResponse struct {
 	StateString string    `json:"state_string"`
 	ExpiresAt   time.Time `json:"expires_at" format:"date-time"`
@@ -208,10 +281,10 @@ type OAuthConversionResponse struct {
 
 // AuthMethods contains authentication method information like whether they are enabled or not or custom text, etc.
 type AuthMethods struct {
-	TermsOfServiceURL string         `json:"terms_of_service_url,omitempty"`
-	Password          AuthMethod     `json:"password"`
-	Github            AuthMethod     `json:"github"`
-	OIDC              OIDCAuthMethod `json:"oidc"`
+	TermsOfServiceURL string           `json:"terms_of_service_url,omitempty"`
+	Password          AuthMethod       `json:"password"`
+	Github            GithubAuthMethod `json:"github"`
+	OIDC              OIDCAuthMethod   `json:"oidc"`
 }
 
 type AuthMethod struct {
@@ -220,6 +293,11 @@ type AuthMethod struct {
 
 type UserLoginType struct {
 	LoginType LoginType `json:"login_type"`
+}
+
+type GithubAuthMethod struct {
+	Enabled                   bool `json:"enabled"`
+	DefaultProviderConfigured bool `json:"default_provider_configured"`
 }
 
 type OIDCAuthMethod struct {
@@ -288,8 +366,26 @@ func (c *Client) CreateFirstUser(ctx context.Context, req CreateFirstUserRequest
 	return resp, json.NewDecoder(res.Body).Decode(&resp)
 }
 
-// CreateUser creates a new user.
+// CreateUser
+// Deprecated: Use CreateUserWithOrgs instead. This will be removed.
+// TODO: When removing, we should rename CreateUserWithOrgs -> CreateUser
+// with an alias of CreateUserWithOrgs.
 func (c *Client) CreateUser(ctx context.Context, req CreateUserRequest) (User, error) {
+	if req.DisableLogin {
+		req.UserLoginType = LoginTypeNone
+	}
+	return c.CreateUserWithOrgs(ctx, CreateUserRequestWithOrgs{
+		Email:           req.Email,
+		Username:        req.Username,
+		Name:            req.Name,
+		Password:        req.Password,
+		UserLoginType:   req.UserLoginType,
+		OrganizationIDs: []uuid.UUID{req.OrganizationID},
+	})
+}
+
+// CreateUserWithOrgs creates a new user.
+func (c *Client) CreateUserWithOrgs(ctx context.Context, req CreateUserRequestWithOrgs) (User, error) {
 	res, err := c.Request(ctx, http.MethodPost, "/api/v2/users", req)
 	if err != nil {
 		return User{}, err
@@ -309,7 +405,9 @@ func (c *Client) DeleteUser(ctx context.Context, id uuid.UUID) error {
 		return err
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusNoContent {
+	// Check for a 200 or a 204 response. 2.14.0 accidentally included a 204 response,
+	// which was a breaking change, and reverted in 2.14.1.
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusNoContent {
 		return ReadBodyAsError(res)
 	}
 	return nil
@@ -326,6 +424,20 @@ func (c *Client) UpdateUserProfile(ctx context.Context, user string, req UpdateU
 		return User{}, ReadBodyAsError(res)
 	}
 	var resp User
+	return resp, json.NewDecoder(res.Body).Decode(&resp)
+}
+
+// ValidateUserPassword validates the complexity of a user password and that it is secured enough.
+func (c *Client) ValidateUserPassword(ctx context.Context, req ValidateUserPasswordRequest) (ValidateUserPasswordResponse, error) {
+	res, err := c.Request(ctx, http.MethodPost, "/api/v2/users/validate-password", req)
+	if err != nil {
+		return ValidateUserPasswordResponse{}, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return ValidateUserPasswordResponse{}, ReadBodyAsError(res)
+	}
+	var resp ValidateUserPasswordResponse
 	return resp, json.NewDecoder(res.Body).Decode(&resp)
 }
 
@@ -484,6 +596,34 @@ func (c *Client) LoginWithPassword(ctx context.Context, req LoginWithPasswordReq
 		return LoginWithPasswordResponse{}, err
 	}
 	return resp, nil
+}
+
+func (c *Client) RequestOneTimePasscode(ctx context.Context, req RequestOneTimePasscodeRequest) error {
+	res, err := c.Request(ctx, http.MethodPost, "/api/v2/users/otp/request", req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusNoContent {
+		return ReadBodyAsError(res)
+	}
+
+	return nil
+}
+
+func (c *Client) ChangePasswordWithOneTimePasscode(ctx context.Context, req ChangePasswordWithOneTimePasscodeRequest) error {
+	res, err := c.Request(ctx, http.MethodPost, "/api/v2/users/otp/change-password", req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusNoContent {
+		return ReadBodyAsError(res)
+	}
+
+	return nil
 }
 
 // ConvertLoginType will send a request to convert the user from password

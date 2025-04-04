@@ -87,6 +87,7 @@ func TestGetManifest(t *testing.T) {
 				Subdomain:    false,
 				SharingLevel: database.AppSharingLevelPublic,
 				Health:       database.WorkspaceAppHealthDisabled,
+				Hidden:       false,
 			},
 			{
 				ID:                   uuid.New(),
@@ -102,10 +103,12 @@ func TestGetManifest(t *testing.T) {
 				HealthcheckUrl:       "http://localhost:4321/health",
 				HealthcheckInterval:  20,
 				HealthcheckThreshold: 5,
+				Hidden:               true,
 			},
 		}
 		scripts = []database.WorkspaceAgentScript{
 			{
+				ID:               uuid.New(),
 				WorkspaceAgentID: agent.ID,
 				LogSourceID:      uuid.New(),
 				LogPath:          "/cool/log/path/1",
@@ -117,6 +120,7 @@ func TestGetManifest(t *testing.T) {
 				TimeoutSeconds:   60,
 			},
 			{
+				ID:               uuid.New(),
 				WorkspaceAgentID: agent.ID,
 				LogSourceID:      uuid.New(),
 				LogPath:          "/cool/log/path/2",
@@ -152,6 +156,21 @@ func TestGetManifest(t *testing.T) {
 				CollectedAt:      someTime.Add(time.Hour),
 			},
 		}
+		devcontainers = []database.WorkspaceAgentDevcontainer{
+			{
+				ID:               uuid.New(),
+				Name:             "cool",
+				WorkspaceAgentID: agent.ID,
+				WorkspaceFolder:  "/cool/folder",
+			},
+			{
+				ID:               uuid.New(),
+				Name:             "another",
+				WorkspaceAgentID: agent.ID,
+				WorkspaceFolder:  "/another/cool/folder",
+				ConfigPath:       "/another/cool/folder/.devcontainer/devcontainer.json",
+			},
+		}
 		derpMapFn = func() *tailcfg.DERPMap {
 			return &tailcfg.DERPMap{
 				Regions: map[int]*tailcfg.DERPRegion{
@@ -182,6 +201,7 @@ func TestGetManifest(t *testing.T) {
 					Threshold: apps[0].HealthcheckThreshold,
 				},
 				Health: agentproto.WorkspaceApp_HEALTHY,
+				Hidden: false,
 			},
 			{
 				Id:            apps[1].ID[:],
@@ -200,6 +220,7 @@ func TestGetManifest(t *testing.T) {
 					Threshold: 0,
 				},
 				Health: agentproto.WorkspaceApp_DISABLED,
+				Hidden: false,
 			},
 			{
 				Id:            apps[2].ID[:],
@@ -218,10 +239,12 @@ func TestGetManifest(t *testing.T) {
 					Threshold: apps[2].HealthcheckThreshold,
 				},
 				Health: agentproto.WorkspaceApp_UNHEALTHY,
+				Hidden: true,
 			},
 		}
 		protoScripts = []*agentproto.WorkspaceAgentScript{
 			{
+				Id:               scripts[0].ID[:],
 				LogSourceId:      scripts[0].LogSourceID[:],
 				LogPath:          scripts[0].LogPath,
 				Script:           scripts[0].Script,
@@ -232,6 +255,7 @@ func TestGetManifest(t *testing.T) {
 				Timeout:          durationpb.New(time.Duration(scripts[0].TimeoutSeconds) * time.Second),
 			},
 			{
+				Id:               scripts[1].ID[:],
 				LogSourceId:      scripts[1].LogSourceID[:],
 				LogPath:          scripts[1].LogPath,
 				Script:           scripts[1].Script,
@@ -258,6 +282,19 @@ func TestGetManifest(t *testing.T) {
 				Timeout:     durationpb.New(time.Duration(metadata[1].Timeout)),
 			},
 		}
+		protoDevcontainers = []*agentproto.WorkspaceAgentDevcontainer{
+			{
+				Id:              devcontainers[0].ID[:],
+				Name:            devcontainers[0].Name,
+				WorkspaceFolder: devcontainers[0].WorkspaceFolder,
+			},
+			{
+				Id:              devcontainers[1].ID[:],
+				Name:            devcontainers[1].Name,
+				WorkspaceFolder: devcontainers[1].WorkspaceFolder,
+				ConfigPath:      devcontainers[1].ConfigPath,
+			},
+		}
 	)
 
 	t.Run("OK", func(t *testing.T) {
@@ -279,11 +316,9 @@ func TestGetManifest(t *testing.T) {
 			AgentFn: func(ctx context.Context) (database.WorkspaceAgent, error) {
 				return agent, nil
 			},
-			WorkspaceIDFn: func(ctx context.Context, _ *database.WorkspaceAgent) (uuid.UUID, error) {
-				return workspace.ID, nil
-			},
-			Database:  mDB,
-			DerpMapFn: derpMapFn,
+			WorkspaceID: workspace.ID,
+			Database:    mDB,
+			DerpMapFn:   derpMapFn,
 		}
 
 		mDB.EXPECT().GetWorkspaceAppsByAgentID(gomock.Any(), agent.ID).Return(apps, nil)
@@ -292,6 +327,7 @@ func TestGetManifest(t *testing.T) {
 			WorkspaceAgentID: agent.ID,
 			Keys:             nil, // all
 		}).Return(metadata, nil)
+		mDB.EXPECT().GetWorkspaceAgentDevcontainersByAgentID(gomock.Any(), agent.ID).Return(devcontainers, nil)
 		mDB.EXPECT().GetWorkspaceByID(gomock.Any(), workspace.ID).Return(workspace, nil)
 		mDB.EXPECT().GetUserByID(gomock.Any(), workspace.OwnerID).Return(owner, nil)
 
@@ -314,10 +350,11 @@ func TestGetManifest(t *testing.T) {
 			// tailnet.DERPMapToProto() is extensively tested elsewhere, so it's
 			// not necessary to manually recreate a big DERP map here like we
 			// did for apps and metadata.
-			DerpMap:  tailnet.DERPMapToProto(derpMapFn()),
-			Scripts:  protoScripts,
-			Apps:     protoApps,
-			Metadata: protoMetadata,
+			DerpMap:       tailnet.DERPMapToProto(derpMapFn()),
+			Scripts:       protoScripts,
+			Apps:          protoApps,
+			Metadata:      protoMetadata,
+			Devcontainers: protoDevcontainers,
 		}
 
 		// Log got and expected with spew.
@@ -346,11 +383,9 @@ func TestGetManifest(t *testing.T) {
 			AgentFn: func(ctx context.Context) (database.WorkspaceAgent, error) {
 				return agent, nil
 			},
-			WorkspaceIDFn: func(ctx context.Context, _ *database.WorkspaceAgent) (uuid.UUID, error) {
-				return workspace.ID, nil
-			},
-			Database:  mDB,
-			DerpMapFn: derpMapFn,
+			WorkspaceID: workspace.ID,
+			Database:    mDB,
+			DerpMapFn:   derpMapFn,
 		}
 
 		mDB.EXPECT().GetWorkspaceAppsByAgentID(gomock.Any(), agent.ID).Return(apps, nil)
@@ -359,6 +394,7 @@ func TestGetManifest(t *testing.T) {
 			WorkspaceAgentID: agent.ID,
 			Keys:             nil, // all
 		}).Return(metadata, nil)
+		mDB.EXPECT().GetWorkspaceAgentDevcontainersByAgentID(gomock.Any(), agent.ID).Return(devcontainers, nil)
 		mDB.EXPECT().GetWorkspaceByID(gomock.Any(), workspace.ID).Return(workspace, nil)
 		mDB.EXPECT().GetUserByID(gomock.Any(), workspace.OwnerID).Return(owner, nil)
 
@@ -381,10 +417,11 @@ func TestGetManifest(t *testing.T) {
 			// tailnet.DERPMapToProto() is extensively tested elsewhere, so it's
 			// not necessary to manually recreate a big DERP map here like we
 			// did for apps and metadata.
-			DerpMap:  tailnet.DERPMapToProto(derpMapFn()),
-			Scripts:  protoScripts,
-			Apps:     protoApps,
-			Metadata: protoMetadata,
+			DerpMap:       tailnet.DERPMapToProto(derpMapFn()),
+			Scripts:       protoScripts,
+			Apps:          protoApps,
+			Metadata:      protoMetadata,
+			Devcontainers: protoDevcontainers,
 		}
 
 		// Log got and expected with spew.

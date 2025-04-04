@@ -14,6 +14,7 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
+	"github.com/tailscale/wireguard-go/tun"
 	"golang.org/x/xerrors"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -22,6 +23,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/connstats"
+	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/tsdial"
@@ -32,6 +34,7 @@ import (
 	tslogger "tailscale.com/types/logger"
 	"tailscale.com/types/netlogtype"
 	"tailscale.com/types/netmap"
+	"tailscale.com/util/dnsname"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/magicsock"
@@ -49,6 +52,7 @@ const (
 	WorkspaceAgentSSHPort             = 1
 	WorkspaceAgentReconnectingPTYPort = 2
 	WorkspaceAgentSpeedtestPort       = 3
+	WorkspaceAgentStandardSSHPort     = 22
 )
 
 // EnvMagicsockDebugLogging enables super-verbose logging for the magicsock
@@ -106,6 +110,16 @@ type Options struct {
 	ClientType proto.TelemetryEvent_ClientType
 	// TelemetrySink is optional.
 	TelemetrySink TelemetrySink
+	// DNSConfigurator is optional, and is passed to the underlying wireguard
+	// engine.
+	DNSConfigurator dns.OSConfigurator
+	// Router is optional, and is passed to the underlying wireguard engine.
+	Router router.Router
+	// TUNDev is optional, and is passed to the underlying wireguard engine.
+	TUNDev tun.Device
+	// WireguardMonitor is optional, and is passed to the underlying wireguard
+	// engine.
+	WireguardMonitor *netmon.Monitor
 }
 
 // TelemetrySink allows tailnet.Conn to send network telemetry to the Coder
@@ -118,6 +132,7 @@ type TelemetrySink interface {
 // NodeID creates a Tailscale NodeID from the last 8 bytes of a UUID. It ensures
 // the returned NodeID is always positive.
 func NodeID(uid uuid.UUID) tailcfg.NodeID {
+	// #nosec G115 - This is safe because the next lines ensure the ID is always positive
 	id := int64(binary.BigEndian.Uint64(uid[8:]))
 
 	// ensure id is positive
@@ -135,6 +150,8 @@ func NewConn(options *Options) (conn *Conn, err error) {
 	if len(options.Addresses) == 0 {
 		return nil, xerrors.New("At least one IP range must be provided")
 	}
+
+	netns.SetEnabled(options.TUNDev != nil)
 
 	var telemetryStore *TelemetryStore
 	if options.TelemetrySink != nil {
@@ -159,13 +176,15 @@ func NewConn(options *Options) (conn *Conn, err error) {
 		nodeID = tailcfg.NodeID(uid)
 	}
 
-	wireguardMonitor, err := netmon.New(Logger(options.Logger.Named("net.wgmonitor")))
-	if err != nil {
-		return nil, xerrors.Errorf("create wireguard link monitor: %w", err)
+	if options.WireguardMonitor == nil {
+		options.WireguardMonitor, err = netmon.New(Logger(options.Logger.Named("net.wgmonitor")))
+		if err != nil {
+			return nil, xerrors.Errorf("create wireguard link monitor: %w", err)
+		}
 	}
 	defer func() {
 		if err != nil {
-			wireguardMonitor.Close()
+			options.WireguardMonitor.Close()
 		}
 	}()
 
@@ -174,10 +193,13 @@ func NewConn(options *Options) (conn *Conn, err error) {
 	}
 	sys := new(tsd.System)
 	wireguardEngine, err := wgengine.NewUserspaceEngine(Logger(options.Logger.Named("net.wgengine")), wgengine.Config{
-		NetMon:       wireguardMonitor,
+		NetMon:       options.WireguardMonitor,
 		Dialer:       dialer,
 		ListenPort:   options.ListenPort,
 		SetSubsystem: sys.Set,
+		DNS:          options.DNSConfigurator,
+		Router:       options.Router,
+		Tun:          options.TUNDev,
 	})
 	if err != nil {
 		return nil, xerrors.Errorf("create wgengine: %w", err)
@@ -188,11 +210,14 @@ func NewConn(options *Options) (conn *Conn, err error) {
 		}
 	}()
 	wireguardEngine.InstallCaptureHook(options.CaptureHook)
-	dialer.UseNetstackForIP = func(ip netip.Addr) bool {
-		_, ok := wireguardEngine.PeerForIP(ip)
-		return ok
+	if options.TUNDev == nil {
+		dialer.UseNetstackForIP = func(ip netip.Addr) bool {
+			_, ok := wireguardEngine.PeerForIP(ip)
+			return ok
+		}
 	}
 
+	wireguardEngine = wgengine.NewWatchdog(wireguardEngine)
 	sys.Set(wireguardEngine)
 
 	magicConn := sys.MagicSock.Get()
@@ -235,11 +260,12 @@ func NewConn(options *Options) (conn *Conn, err error) {
 		return nil, xerrors.Errorf("create netstack: %w", err)
 	}
 
-	dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		return netStack.DialContextTCP(ctx, dst)
+	if options.TUNDev == nil {
+		dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+			return netStack.DialContextTCP(ctx, dst)
+		}
+		netStack.ProcessLocalIPs = true
 	}
-	netStack.ProcessLocalIPs = true
-	wireguardEngine = wgengine.NewWatchdog(wireguardEngine)
 
 	cfgMaps := newConfigMaps(
 		options.Logger,
@@ -274,7 +300,7 @@ func NewConn(options *Options) (conn *Conn, err error) {
 		listeners:        map[listenKey]*listener{},
 		tunDevice:        sys.Tun.Get(),
 		netStack:         netStack,
-		wireguardMonitor: wireguardMonitor,
+		wireguardMonitor: options.WireguardMonitor,
 		wireguardRouter: &router.Config{
 			LocalAddrs: options.Addresses,
 		},
@@ -282,6 +308,7 @@ func NewConn(options *Options) (conn *Conn, err error) {
 		configMaps:      cfgMaps,
 		nodeUpdater:     nodeUp,
 		telemetrySink:   options.TelemetrySink,
+		dnsConfigurator: options.DNSConfigurator,
 		telemetryStore:  telemetryStore,
 		createdAt:       time.Now(),
 		watchCtx:        ctx,
@@ -294,6 +321,9 @@ func NewConn(options *Options) (conn *Conn, err error) {
 	}()
 	if server.telemetryStore != nil {
 		server.wireguardEngine.SetNetInfoCallback(func(ni *tailcfg.NetInfo) {
+			server.mutex.Lock()
+			server.lastNetInfo = ni.Clone()
+			server.mutex.Unlock()
 			server.telemetryStore.setNetInfo(ni)
 			nodeUp.setNetInfo(ni)
 			server.telemetryStore.pingPeer(server)
@@ -304,7 +334,12 @@ func NewConn(options *Options) (conn *Conn, err error) {
 		})
 		go server.watchConnChange()
 	} else {
-		server.wireguardEngine.SetNetInfoCallback(nodeUp.setNetInfo)
+		server.wireguardEngine.SetNetInfoCallback(func(ni *tailcfg.NetInfo) {
+			server.mutex.Lock()
+			server.lastNetInfo = ni.Clone()
+			server.mutex.Unlock()
+			nodeUp.setNetInfo(ni)
+		})
 	}
 	server.wireguardEngine.SetStatusCallback(nodeUp.setStatus)
 	server.magicConn.SetDERPForcedWebsocketCallback(nodeUp.setDERPForcedWebsocket)
@@ -319,28 +354,54 @@ func NewConn(options *Options) (conn *Conn, err error) {
 	return server, nil
 }
 
-func maskUUID(uid uuid.UUID) uuid.UUID {
-	// This is Tailscale's ephemeral service prefix. This can be changed easily
-	// later-on, because all of our nodes are ephemeral.
-	// fd7a:115c:a1e0
-	uid[0] = 0xfd
-	uid[1] = 0x7a
-	uid[2] = 0x11
-	uid[3] = 0x5c
-	uid[4] = 0xa1
-	uid[5] = 0xe0
+type ServicePrefix [6]byte
+
+var (
+	// TailscaleServicePrefix is the IPv6 prefix for all tailnet nodes since it was first added to
+	// Coder.  It is identical to the service prefix Tailscale.com uses. With the introduction of
+	// CoderVPN, we would like to stop using the Tailscale prefix so that we don't conflict with
+	// Tailscale if both are installed at the same time. However, there are a large number of agents
+	// and clients using this prefix, so we need to carefully manage deprecation and eventual
+	// removal.
+	// fd7a:115c:a1e0:://48
+	TailscaleServicePrefix ServicePrefix = [6]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0}
+	// CoderServicePrefix is the Coder-specific IPv6 prefix for tailnet nodes, which we are in the
+	// process of migrating to. It allows Coder to run alongside Tailscale without conflicts even
+	// if both are set up as TUN interfaces into the OS (e.g. CoderVPN).
+	// fd60:627a:a42b::/48
+	CoderServicePrefix ServicePrefix = [6]byte{0xfd, 0x60, 0x62, 0x7a, 0xa4, 0x2b}
+)
+
+// maskUUID returns a new UUID with the first 6 bytes changed to the ServicePrefix
+func (p ServicePrefix) maskUUID(uid uuid.UUID) uuid.UUID {
+	copy(uid[:], p[:])
 	return uid
 }
 
-// IP generates a random IP with a static service prefix.
-func IP() netip.Addr {
-	uid := maskUUID(uuid.New())
-	return netip.AddrFrom16(uid)
+// RandomAddr returns a random IP address in the service prefix.
+func (p ServicePrefix) RandomAddr() netip.Addr {
+	return netip.AddrFrom16(p.maskUUID(uuid.New()))
 }
 
-// IP generates a new IP from a UUID.
-func IPFromUUID(uid uuid.UUID) netip.Addr {
-	return netip.AddrFrom16(maskUUID(uid))
+// AddrFromUUID returns an IPv6 address corresponding to the given UUID in the service prefix.
+func (p ServicePrefix) AddrFromUUID(uid uuid.UUID) netip.Addr {
+	return netip.AddrFrom16(p.maskUUID(uid))
+}
+
+// PrefixFromUUID returns a single IPv6 /128 prefix corresponding to the given UUID.
+func (p ServicePrefix) PrefixFromUUID(uid uuid.UUID) netip.Prefix {
+	return netip.PrefixFrom(p.AddrFromUUID(uid), 128)
+}
+
+// RandomPrefix returns a single IPv6 /128 prefix within the service prefix.
+func (p ServicePrefix) RandomPrefix() netip.Prefix {
+	return netip.PrefixFrom(p.RandomAddr(), 128)
+}
+
+func (p ServicePrefix) AsNetip() netip.Prefix {
+	out := [16]byte{}
+	copy(out[:], p[:])
+	return netip.PrefixFrom(netip.AddrFrom16(out), 48)
 }
 
 // Conn is an actively listening Wireguard connection.
@@ -360,6 +421,7 @@ type Conn struct {
 	wireguardMonitor *netmon.Monitor
 	wireguardRouter  *router.Config
 	wireguardEngine  wgengine.Engine
+	dnsConfigurator  dns.OSConfigurator
 	listeners        map[listenKey]*listener
 	clientType       proto.TelemetryEvent_ClientType
 	createdAt        time.Time
@@ -373,6 +435,13 @@ type Conn struct {
 	watchCancel func()
 
 	trafficStats *connstats.Statistics
+	lastNetInfo  *tailcfg.NetInfo
+}
+
+func (c *Conn) GetNetInfo() *tailcfg.NetInfo {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.lastNetInfo.Clone()
 }
 
 func (c *Conn) SetTunnelDestination(id uuid.UUID) {
@@ -396,6 +465,15 @@ func (c *Conn) MagicsockSetDebugLoggingEnabled(enabled bool) {
 func (c *Conn) SetAddresses(ips []netip.Prefix) error {
 	c.configMaps.setAddresses(ips)
 	c.nodeUpdater.setAddresses(ips)
+	return nil
+}
+
+// SetDNSHosts replaces the map of DNS hosts for the connection.
+func (c *Conn) SetDNSHosts(hosts map[dnsname.FQDN][]netip.Addr) error {
+	if c.dnsConfigurator == nil {
+		return xerrors.New("no DNSConfigurator set")
+	}
+	c.configMaps.setHosts(hosts)
 	return nil
 }
 
@@ -556,7 +634,6 @@ func (c *Conn) Closed() <-chan struct{} {
 func (c *Conn) Close() error {
 	c.logger.Info(context.Background(), "closing tailnet Conn")
 	c.watchCancel()
-	c.telemetryWg.Wait()
 	c.configMaps.close()
 	c.nodeUpdater.close()
 	c.mutex.Lock()
@@ -567,6 +644,7 @@ func (c *Conn) Close() error {
 	default:
 	}
 	close(c.closed)
+	c.telemetryWg.Wait()
 	c.mutex.Unlock()
 
 	var wg sync.WaitGroup
@@ -669,7 +747,7 @@ func (c *Conn) forwardTCP(src, dst netip.AddrPort) (handler func(net.Conn), opts
 		return nil, nil, false
 	}
 	// See: https://github.com/tailscale/tailscale/blob/c7cea825aea39a00aca71ea02bab7266afc03e7c/wgengine/netstack/netstack.go#L888
-	if dst.Port() == WorkspaceAgentSSHPort || dst.Port() == 22 {
+	if dst.Port() == WorkspaceAgentSSHPort || dst.Port() == WorkspaceAgentStandardSSHPort {
 		opt := tcpip.KeepaliveIdleOption(72 * time.Hour)
 		opts = append(opts, &opt)
 	}
@@ -733,6 +811,7 @@ func (c *Conn) SendConnectedTelemetry(ip netip.Addr, application string) {
 	c.telemetryStore.markConnected(&ip, application)
 	e := c.newTelemetryEvent()
 	e.Status = proto.TelemetryEvent_CONNECTED
+	e.ConnectionSetup = durationpb.New(time.Since(c.createdAt))
 	c.sendTelemetryBackground(e)
 }
 
@@ -783,6 +862,13 @@ func (c *Conn) newTelemetryEvent() *proto.TelemetryEvent {
 }
 
 func (c *Conn) sendTelemetryBackground(e *proto.TelemetryEvent) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	select {
+	case <-c.closed:
+		return
+	default:
+	}
 	c.telemetryWg.Add(1)
 	go func() {
 		defer c.telemetryWg.Done()
@@ -838,6 +924,10 @@ func (c *Conn) GetPeerDiagnostics(peerID uuid.UUID) PeerDiagnostics {
 	c.nodeUpdater.fillPeerDiagnostics(&d)
 	c.configMaps.fillPeerDiagnostics(&d, peerID)
 	return d
+}
+
+func (c *Conn) GetKnownPeerIDs() []uuid.UUID {
+	return c.configMaps.knownPeerIDs()
 }
 
 type listenKey struct {

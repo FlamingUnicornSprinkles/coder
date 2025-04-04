@@ -44,6 +44,7 @@ func TestManifest(t *testing.T) {
 					Threshold: 55555666,
 				},
 				Health: codersdk.WorkspaceAppHealthHealthy,
+				Hidden: false,
 			},
 			{
 				ID:            uuid.New(),
@@ -62,6 +63,7 @@ func TestManifest(t *testing.T) {
 					Threshold: 22555666,
 				},
 				Health: codersdk.WorkspaceAppHealthInitializing,
+				Hidden: true,
 			},
 		},
 		DERPMap: &tailcfg.DERPMap{
@@ -104,6 +106,7 @@ func TestManifest(t *testing.T) {
 		},
 		Scripts: []codersdk.WorkspaceAgentScript{
 			{
+				ID:               uuid.New(),
 				LogSourceID:      uuid.New(),
 				LogPath:          "/var/log/script.log",
 				Script:           "script",
@@ -112,8 +115,10 @@ func TestManifest(t *testing.T) {
 				RunOnStop:        true,
 				StartBlocksLogin: true,
 				Timeout:          time.Second,
+				DisplayName:      "foo",
 			},
 			{
+				ID:               uuid.New(),
 				LogSourceID:      uuid.New(),
 				LogPath:          "/var/log/script2.log",
 				Script:           "script2",
@@ -122,6 +127,14 @@ func TestManifest(t *testing.T) {
 				RunOnStop:        true,
 				StartBlocksLogin: true,
 				Timeout:          time.Second * 4,
+				DisplayName:      "bar",
+			},
+		},
+		Devcontainers: []codersdk.WorkspaceAgentDevcontainer{
+			{
+				ID:              uuid.New(),
+				WorkspaceFolder: "/home/coder/coder",
+				ConfigPath:      "/home/coder/coder/.devcontainer/devcontainer.json",
 			},
 		},
 	}
@@ -146,6 +159,7 @@ func TestManifest(t *testing.T) {
 	require.Equal(t, manifest.DisableDirectConnections, back.DisableDirectConnections)
 	require.Equal(t, manifest.Metadata, back.Metadata)
 	require.Equal(t, manifest.Scripts, back.Scripts)
+	require.Equal(t, manifest.Devcontainers, back.Devcontainers)
 }
 
 func TestSubsystems(t *testing.T) {

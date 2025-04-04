@@ -53,14 +53,14 @@ func run() error {
 	}
 	databasePath := filepath.Join(localPath, "..", "..", "..", "coderd", "database")
 
-	err = orderAndStubDatabaseFunctions(filepath.Join(databasePath, "dbmem", "dbmem.go"), "q", "FakeQuerier", func(params stubParams) string {
+	err = orderAndStubDatabaseFunctions(filepath.Join(databasePath, "dbmem", "dbmem.go"), "q", "FakeQuerier", func(_ stubParams) string {
 		return `panic("not implemented")`
 	})
 	if err != nil {
 		return xerrors.Errorf("stub dbmem: %w", err)
 	}
 
-	err = orderAndStubDatabaseFunctions(filepath.Join(databasePath, "dbmetrics", "dbmetrics.go"), "m", "metricsStore", func(params stubParams) string {
+	err = orderAndStubDatabaseFunctions(filepath.Join(databasePath, "dbmetrics", "querymetrics.go"), "m", "queryMetricsStore", func(params stubParams) string {
 		return fmt.Sprintf(`
 start := time.Now()
 %s := m.s.%s(%s)
@@ -72,7 +72,7 @@ return %s
 		return xerrors.Errorf("stub dbmetrics: %w", err)
 	}
 
-	err = orderAndStubDatabaseFunctions(filepath.Join(databasePath, "dbauthz", "dbauthz.go"), "q", "querier", func(params stubParams) string {
+	err = orderAndStubDatabaseFunctions(filepath.Join(databasePath, "dbauthz", "dbauthz.go"), "q", "querier", func(_ stubParams) string {
 		return `panic("not implemented")`
 	})
 	if err != nil {
@@ -340,7 +340,7 @@ func orderAndStubDatabaseFunctions(filePath, receiver, structName string, stub f
 			})
 			for _, r := range fn.Func.Results.List {
 				switch typ := r.Type.(type) {
-				case *dst.StarExpr, *dst.ArrayType:
+				case *dst.StarExpr, *dst.ArrayType, *dst.SelectorExpr:
 					returnStmt.Results = append(returnStmt.Results, dst.NewIdent("nil"))
 				case *dst.Ident:
 					if typ.Path != "" {

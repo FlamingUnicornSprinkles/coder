@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -14,9 +16,11 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/dns"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
+	"tailscale.com/util/dnsname"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/router"
@@ -29,6 +33,10 @@ import (
 )
 
 const lostTimeout = 15 * time.Minute
+
+// CoderDNSSuffix is the default DNS suffix that we append to Coder DNS
+// records.
+const CoderDNSSuffix = "coder."
 
 // engineConfigurable is the subset of wgengine.Engine that we use for configuration.
 //
@@ -63,6 +71,7 @@ type configMaps struct {
 
 	engine         engineConfigurable
 	static         netmap.NetworkMap
+	hosts          map[dnsname.FQDN][]netip.Addr
 	peers          map[uuid.UUID]*peerLifecycle
 	addresses      []netip.Prefix
 	derpMap        *tailcfg.DERPMap
@@ -79,6 +88,7 @@ func newConfigMaps(logger slog.Logger, engine engineConfigurable, nodeID tailcfg
 		phased: phased{Cond: *(sync.NewCond(&sync.Mutex{}))},
 		logger: logger,
 		engine: engine,
+		hosts:  make(map[dnsname.FQDN][]netip.Addr),
 		static: netmap.NetworkMap{
 			SelfNode: &tailcfg.Node{
 				ID:       nodeID,
@@ -147,22 +157,23 @@ func (c *configMaps) configLoop() {
 		if c.derpMapDirty {
 			derpMap := c.derpMapLocked()
 			actions = append(actions, func() {
-				c.logger.Info(context.Background(), "updating engine DERP map", slog.F("derp_map", (*derpMapStringer)(derpMap)))
+				c.logger.Debug(context.Background(), "updating engine DERP map", slog.F("derp_map", (*derpMapStringer)(derpMap)))
 				c.engine.SetDERPMap(derpMap)
 			})
 		}
 		if c.netmapDirty {
 			nm := c.netMapLocked()
+			hosts := c.hostsLocked()
 			actions = append(actions, func() {
-				c.logger.Info(context.Background(), "updating engine network map", slog.F("network_map", nm))
+				c.logger.Debug(context.Background(), "updating engine network map", slog.F("network_map", nm))
 				c.engine.SetNetworkMap(nm)
-				c.reconfig(nm)
+				c.reconfig(nm, hosts)
 			})
 		}
 		if c.filterDirty {
 			f := c.filterLocked()
 			actions = append(actions, func() {
-				c.logger.Info(context.Background(), "updating engine filter", slog.F("filter", f))
+				c.logger.Debug(context.Background(), "updating engine filter", slog.F("filter", f))
 				c.engine.SetFilter(f)
 			})
 		}
@@ -212,6 +223,11 @@ func (c *configMaps) netMapLocked() *netmap.NetworkMap {
 	return nm
 }
 
+// hostsLocked returns the current DNS hosts mapping.  c.L must be held.
+func (c *configMaps) hostsLocked() map[dnsname.FQDN][]netip.Addr {
+	return maps.Clone(c.hosts)
+}
+
 // peerConfigLocked returns the set of peer nodes we have.  c.L must be held.
 func (c *configMaps) peerConfigLocked() []*tailcfg.Node {
 	out := make([]*tailcfg.Node, 0, len(c.peers))
@@ -239,6 +255,7 @@ func (c *configMaps) setTunnelDestination(id uuid.UUID) {
 		lc = &peerLifecycle{
 			peerID: id,
 		}
+		c.logger.Debug(context.Background(), "setting peer tunnel destination", slog.F("peer_id", id))
 		c.peers[id] = lc
 	}
 	lc.isDestination = true
@@ -257,6 +274,17 @@ func (c *configMaps) setAddresses(ips []netip.Prefix) {
 	copy(c.addresses, ips)
 	c.netmapDirty = true
 	c.filterDirty = true
+	c.Broadcast()
+}
+
+func (c *configMaps) setHosts(hosts map[dnsname.FQDN][]netip.Addr) {
+	c.L.Lock()
+	defer c.L.Unlock()
+	c.hosts = make(map[dnsname.FQDN][]netip.Addr)
+	for name, addrs := range hosts {
+		c.hosts[name] = slices.Clone(addrs)
+	}
+	c.netmapDirty = true
 	c.Broadcast()
 }
 
@@ -304,7 +332,15 @@ func (c *configMaps) derpMapLocked() *tailcfg.DERPMap {
 // reconfig computes the correct wireguard config and calls the engine.Reconfig
 // with the config we have.  It is not intended for this to be called outside of
 // the updateLoop()
-func (c *configMaps) reconfig(nm *netmap.NetworkMap) {
+func (c *configMaps) reconfig(nm *netmap.NetworkMap, hosts map[dnsname.FQDN][]netip.Addr) {
+	dnsCfg := &dns.Config{}
+	if len(hosts) > 0 {
+		dnsCfg.Hosts = hosts
+		dnsCfg.OnlyIPv6 = true
+		dnsCfg.Routes = map[dnsname.FQDN][]*dnstype.Resolver{
+			CoderDNSSuffix: nil,
+		}
+	}
 	cfg, err := nmcfg.WGCfg(nm, Logger(c.logger.Named("net.wgconfig")), netmap.AllowSingleHosts, "")
 	if err != nil {
 		// WGCfg never returns an error at the time this code was written.  If it starts, returning
@@ -313,8 +349,11 @@ func (c *configMaps) reconfig(nm *netmap.NetworkMap) {
 		return
 	}
 
-	rc := &router.Config{LocalAddrs: nm.Addresses}
-	err = c.engine.Reconfig(cfg, rc, &dns.Config{}, &tailcfg.Debug{})
+	rc := &router.Config{
+		LocalAddrs: nm.Addresses,
+		Routes:     []netip.Prefix{CoderServicePrefix.AsNetip()},
+	}
+	err = c.engine.Reconfig(cfg, rc, dnsCfg, &tailcfg.Debug{})
 	if err != nil {
 		if errors.Is(err, wgengine.ErrNoChanges) {
 			return
@@ -606,6 +645,16 @@ func (c *configMaps) fillPeerDiagnostics(d *PeerDiagnostics, peerID uuid.UUID) {
 		return
 	}
 	d.LastWireguardHandshake = ps.LastHandshake
+}
+
+func (c *configMaps) knownPeerIDs() []uuid.UUID {
+	c.L.Lock()
+	defer c.L.Unlock()
+	out := make([]uuid.UUID, 0, len(c.peers))
+	for id := range c.peers {
+		out = append(out, id)
+	}
+	return out
 }
 
 func (c *configMaps) peerReadyForHandshakeTimeout(peerID uuid.UUID) {

@@ -118,6 +118,8 @@ func BitmapToWeekdays(bitmap uint8) []string {
 	return days
 }
 
+var AllDaysOfWeek = []string{"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
+
 type TemplateAutostartRequirement struct {
 	// DaysOfWeek is a list of days of the week in which autostart is allowed
 	// to happen. If no days are specified, autostart is not allowed.
@@ -240,14 +242,14 @@ type UpdateTemplateMeta struct {
 	// any new workspaces from using this template.
 	// If passed an empty string, will remove the deprecated message, making
 	// the template usable for new workspaces again.
-	DeprecationMessage *string `json:"deprecation_message"`
+	DeprecationMessage *string `json:"deprecation_message,omitempty"`
 	// DisableEveryoneGroupAccess allows optionally disabling the default
 	// behavior of granting the 'everyone' group access to use the template.
 	// If this is set to true, the template will not be available to all users,
 	// and must be explicitly granted to users or groups in the permissions settings
 	// of the template.
 	DisableEveryoneGroupAccess bool                          `json:"disable_everyone_group_access"`
-	MaxPortShareLevel          *WorkspaceAgentPortShareLevel `json:"max_port_share_level"`
+	MaxPortShareLevel          *WorkspaceAgentPortShareLevel `json:"max_port_share_level,omitempty"`
 }
 
 type TemplateExample struct {
@@ -472,9 +474,16 @@ type AgentStatsReportResponse struct {
 	TxBytes int64 `json:"tx_bytes"`
 }
 
-// TemplateExamples lists example templates embedded in coder.
-func (c *Client) TemplateExamples(ctx context.Context, organizationID uuid.UUID) ([]TemplateExample, error) {
-	res, err := c.Request(ctx, http.MethodGet, fmt.Sprintf("/api/v2/organizations/%s/templates/examples", organizationID), nil)
+// TemplateExamples lists example templates available in Coder.
+//
+// Deprecated: Use StarterTemplates instead.
+func (c *Client) TemplateExamples(ctx context.Context, _ uuid.UUID) ([]TemplateExample, error) {
+	return c.StarterTemplates(ctx)
+}
+
+// StarterTemplates lists example templates available in Coder.
+func (c *Client) StarterTemplates(ctx context.Context) ([]TemplateExample, error) {
+	res, err := c.Request(ctx, http.MethodGet, "/api/v2/templates/examples", nil)
 	if err != nil {
 		return nil, err
 	}

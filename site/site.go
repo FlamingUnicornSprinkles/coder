@@ -19,6 +19,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,17 +30,19 @@ import (
 	"github.com/justinas/nosurf"
 	"github.com/klauspost/compress/zstd"
 	"github.com/unrolled/secure"
-	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/xerrors"
 
+	"cdr.dev/slog"
 	"github.com/coder/coder/v2/coderd/appearance"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/db2sdk"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
+	"github.com/coder/coder/v2/coderd/entitlements"
 	"github.com/coder/coder/v2/coderd/httpapi"
 	"github.com/coder/coder/v2/coderd/httpmw"
+	"github.com/coder/coder/v2/coderd/telemetry"
 	"github.com/coder/coder/v2/codersdk"
 )
 
@@ -79,17 +82,22 @@ type Options struct {
 	DocsURL           string
 	BuildInfo         codersdk.BuildInfoResponse
 	AppearanceFetcher *atomic.Pointer[appearance.Fetcher]
+	Entitlements      *entitlements.Set
+	Telemetry         telemetry.Reporter
+	Logger            slog.Logger
 }
 
 func New(opts *Options) *Handler {
 	if opts.AppearanceFetcher == nil {
 		daf := atomic.Pointer[appearance.Fetcher]{}
-		daf.Store(&appearance.DefaultFetcher)
+		f := appearance.NewDefaultFetcher(opts.DocsURL)
+		daf.Store(&f)
 		opts.AppearanceFetcher = &daf
 	}
 	handler := &Handler{
 		opts:          opts,
 		secureHeaders: secureHeaders(),
+		Entitlements:  opts.Entitlements,
 	}
 
 	// html files are handled by a text/template. Non-html files
@@ -156,6 +164,11 @@ func New(opts *Options) *Handler {
 	handler.buildInfoJSON = html.EscapeString(string(buildInfoResponse))
 	handler.handler = mux.ServeHTTP
 
+	handler.installScript, err = parseInstallScript(opts.SiteFS, opts.BuildInfo)
+	if err != nil {
+		opts.Logger.Warn(context.Background(), "could not parse install.sh, it will be unavailable", slog.Error(err))
+	}
+
 	return handler
 }
 
@@ -165,15 +178,17 @@ type Handler struct {
 	secureHeaders *secure.Secure
 	handler       http.HandlerFunc
 	htmlTemplates *template.Template
-
 	buildInfoJSON string
+	installScript []byte
 
 	// RegionsFetcher will attempt to fetch the more detailed WorkspaceProxy data, but will fall back to the
 	// regions if the user does not have the correct permissions.
 	RegionsFetcher func(ctx context.Context) (any, error)
 
-	Entitlements atomic.Pointer[codersdk.Entitlements]
+	Entitlements *entitlements.Set
 	Experiments  atomic.Pointer[codersdk.Experiments]
+
+	telemetryHTMLServedOnce sync.Once
 }
 
 func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
@@ -200,6 +215,28 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	// If requesting binaries, serve straight up.
 	case reqFile == "bin" || strings.HasPrefix(reqFile, "bin/"):
 		h.handler.ServeHTTP(rw, r)
+		return
+	// If requesting assets, serve straight up with caching.
+	case reqFile == "assets" || strings.HasPrefix(reqFile, "assets/"):
+		// It could make sense to cache 404s, but the problem is that during an
+		// upgrade a load balancer may route partially to the old server, and that
+		// would make new asset paths get cached as 404s and not load even once the
+		// new server was in place.  To combat that, only cache if we have the file.
+		if h.exists(reqFile) && ShouldCacheFile(reqFile) {
+			rw.Header().Add("Cache-Control", "public, max-age=31536000, immutable")
+		}
+		// If the asset does not exist, this will return a 404.
+		h.handler.ServeHTTP(rw, r)
+		return
+	// If requesting the install.sh script, respond with the preprocessed version
+	// which contains the correct hostname and version information.
+	case reqFile == "install.sh":
+		if h.installScript == nil {
+			http.NotFound(rw, r)
+			return
+		}
+		rw.Header().Add("Content-Type", "text/plain; charset=utf-8")
+		http.ServeContent(rw, r, reqFile, time.Time{}, bytes.NewReader(h.installScript))
 		return
 	// If the original file path exists we serve it.
 	case h.exists(reqFile):
@@ -255,13 +292,14 @@ type htmlState struct {
 	ApplicationName string
 	LogoURL         string
 
-	BuildInfo    string
-	User         string
-	Entitlements string
-	Appearance   string
-	Experiments  string
-	Regions      string
-	DocsURL      string
+	BuildInfo      string
+	User           string
+	Entitlements   string
+	Appearance     string
+	UserAppearance string
+	Experiments    string
+	Regions        string
+	DocsURL        string
 }
 
 type csrfState struct {
@@ -290,12 +328,51 @@ func ShouldCacheFile(reqFile string) bool {
 	return true
 }
 
+// reportHTMLFirstServedAt sends a telemetry report when the first HTML is ever served.
+// The purpose is to track the first time the first user opens the site.
+func (h *Handler) reportHTMLFirstServedAt() {
+	// nolint:gocritic // Manipulating telemetry items is system-restricted.
+	// TODO(hugodutka): Add a telemetry context in RBAC.
+	ctx := dbauthz.AsSystemRestricted(context.Background())
+	itemKey := string(telemetry.TelemetryItemKeyHTMLFirstServedAt)
+	_, err := h.opts.Database.GetTelemetryItem(ctx, itemKey)
+	if err == nil {
+		// If the value is already set, then we reported it before.
+		// We don't need to report it again.
+		return
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		h.opts.Logger.Debug(ctx, "failed to get telemetry html first served at", slog.Error(err))
+		return
+	}
+	if err := h.opts.Database.InsertTelemetryItemIfNotExists(ctx, database.InsertTelemetryItemIfNotExistsParams{
+		Key:   string(telemetry.TelemetryItemKeyHTMLFirstServedAt),
+		Value: time.Now().Format(time.RFC3339),
+	}); err != nil {
+		h.opts.Logger.Debug(ctx, "failed to set telemetry html first served at", slog.Error(err))
+		return
+	}
+	item, err := h.opts.Database.GetTelemetryItem(ctx, itemKey)
+	if err != nil {
+		h.opts.Logger.Debug(ctx, "failed to get telemetry html first served at", slog.Error(err))
+		return
+	}
+	h.opts.Telemetry.Report(&telemetry.Snapshot{
+		TelemetryItems: []telemetry.TelemetryItem{telemetry.ConvertTelemetryItem(item)},
+	})
+}
+
 func (h *Handler) serveHTML(resp http.ResponseWriter, request *http.Request, reqPath string, state htmlState) bool {
 	if data, err := h.renderHTMLWithState(request, reqPath, state); err == nil {
 		if reqPath == "" {
 			// Pass "index.html" to the ServeContent so the ServeContent sets the right content headers.
 			reqPath = "index.html"
 		}
+		// `Once` is used to reduce the volume of db calls and telemetry reports.
+		// It's fine to run the enclosed function multiple times, but it's unnecessary.
+		h.telemetryHTMLServedOnce.Do(func() {
+			go h.reportHTMLFirstServedAt()
+		})
 		http.ServeContent(resp, request, reqPath, time.Time{}, bytes.NewReader(data))
 		return true
 	}
@@ -350,10 +427,20 @@ func (h *Handler) renderHTMLWithState(r *http.Request, filePath string, state ht
 
 	var eg errgroup.Group
 	var user database.User
+	var themePreference string
 	orgIDs := []uuid.UUID{}
 	eg.Go(func() error {
 		var err error
 		user, err = h.opts.Database.GetUserByID(ctx, apiKey.UserID)
+		return err
+	})
+	eg.Go(func() error {
+		var err error
+		themePreference, err = h.opts.Database.GetUserAppearanceSettings(ctx, apiKey.UserID)
+		if errors.Is(err, sql.ErrNoRows) {
+			themePreference = ""
+			return nil
+		}
 		return err
 	})
 	eg.Go(func() error {
@@ -378,15 +465,23 @@ func (h *Handler) renderHTMLWithState(r *http.Request, filePath string, state ht
 				state.User = html.EscapeString(string(user))
 			}
 		}()
-		entitlements := h.Entitlements.Load()
-		if entitlements != nil {
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			userAppearance, err := json.Marshal(codersdk.UserAppearanceSettings{
+				ThemePreference: themePreference,
+			})
+			if err == nil {
+				state.UserAppearance = html.EscapeString(string(userAppearance))
+			}
+		}()
+
+		if h.Entitlements != nil {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				entitlements, err := json.Marshal(entitlements)
-				if err == nil {
-					state.Entitlements = html.EscapeString(string(entitlements))
-				}
+				state.Entitlements = html.EscapeString(string(h.Entitlements.AsJSON()))
 			}()
 		}
 
@@ -518,6 +613,32 @@ func findAndParseHTMLFiles(files fs.FS) (*template.Template, error) {
 		return nil, err
 	}
 	return root, nil
+}
+
+type installScriptState struct {
+	Origin  string
+	Version string
+}
+
+func parseInstallScript(files fs.FS, buildInfo codersdk.BuildInfoResponse) ([]byte, error) {
+	scriptFile, err := fs.ReadFile(files, "install.sh")
+	if err != nil {
+		return nil, err
+	}
+
+	script, err := template.New("install.sh").Parse(string(scriptFile))
+	if err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	state := installScriptState{Origin: buildInfo.DashboardURL, Version: buildInfo.Version}
+	err = script.Execute(&buf, state)
+	if err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
 }
 
 // ExtractOrReadBinFS checks the provided fs for compressed coder binaries and

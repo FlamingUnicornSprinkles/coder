@@ -1,32 +1,40 @@
-import { test, expect } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import { createUser, getCurrentOrgId, setupApiCalls } from "../../api";
-import { requiresEnterpriseLicense } from "../../helpers";
+import { defaultOrganizationName, users } from "../../constants";
+import { login, requiresLicense } from "../../helpers";
 import { beforeCoderTest } from "../../hooks";
 
-test.beforeEach(async ({ page }) => await beforeCoderTest(page));
+test.beforeEach(async ({ page }) => {
+	beforeCoderTest(page);
+	await login(page, users.userAdmin);
+});
 
 const DEFAULT_GROUP_NAME = "Everyone";
 
 test(`Every user should be automatically added to the default '${DEFAULT_GROUP_NAME}' group upon creation`, async ({
-  page,
-  baseURL,
+	page,
+	baseURL,
 }) => {
-  requiresEnterpriseLicense();
-  await setupApiCalls(page);
-  const orgId = await getCurrentOrgId();
-  const numberOfMembers = 3;
-  const users = await Promise.all(
-    Array.from({ length: numberOfMembers }, () => createUser(orgId)),
-  );
+	requiresLicense();
+	await setupApiCalls(page);
 
-  await page.goto(`${baseURL}/groups`, { waitUntil: "domcontentloaded" });
-  await expect(page).toHaveTitle("Groups - Coder");
+	const orgName = defaultOrganizationName;
+	const orgId = await getCurrentOrgId();
+	const numberOfMembers = 3;
+	const users = await Promise.all(
+		Array.from({ length: numberOfMembers }, () => createUser(orgId)),
+	);
 
-  const groupRow = page.getByRole("row", { name: DEFAULT_GROUP_NAME });
-  await groupRow.click();
-  await expect(page).toHaveTitle(`${DEFAULT_GROUP_NAME} - Coder`);
+	await page.goto(`${baseURL}/organizations/${orgName}/groups`, {
+		waitUntil: "domcontentloaded",
+	});
+	await expect(page).toHaveTitle("Groups - Coder");
 
-  for (const user of users) {
-    await expect(page.getByRole("row", { name: user.username })).toBeVisible();
-  }
+	const groupRow = page.getByText(DEFAULT_GROUP_NAME);
+	await groupRow.click();
+	await expect(page).toHaveTitle(`${DEFAULT_GROUP_NAME} - Coder`);
+
+	for (const user of users) {
+		await expect(page.getByRole("row", { name: user.username })).toBeVisible();
+	}
 });

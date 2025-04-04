@@ -22,6 +22,7 @@ import (
 
 	"github.com/coder/coder/v2/coderd/tracing"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/coder/v2/codersdk/healthsdk"
 	"github.com/coder/coder/v2/tailnet"
 )
 
@@ -50,7 +51,7 @@ type AgentConnOptions struct {
 }
 
 func (c *AgentConn) agentAddress() netip.Addr {
-	return tailnet.IPFromUUID(c.opts.AgentID)
+	return tailnet.TailscaleServicePrefix.AddrFromUUID(c.opts.AgentID)
 }
 
 // AwaitReachable waits for the agent to be reachable.
@@ -92,6 +93,26 @@ type AgentReconnectingPTYInit struct {
 	Height  uint16
 	Width   uint16
 	Command string
+	// Container, if set, will attempt to exec into a running container visible to the agent.
+	// This should be a unique container ID (implementation-dependent).
+	Container string
+	// ContainerUser, if set, will set the target user when execing into a container.
+	// This can be a username or UID, depending on the underlying implementation.
+	// This is ignored if Container is not set.
+	ContainerUser string
+
+	BackendType string
+}
+
+// AgentReconnectingPTYInitOption is a functional option for AgentReconnectingPTYInit.
+type AgentReconnectingPTYInitOption func(*AgentReconnectingPTYInit)
+
+// AgentReconnectingPTYInitWithContainer sets the container and container user for the reconnecting PTY session.
+func AgentReconnectingPTYInitWithContainer(container, containerUser string) AgentReconnectingPTYInitOption {
+	return func(init *AgentReconnectingPTYInit) {
+		init.Container = container
+		init.ContainerUser = containerUser
+	}
 }
 
 // ReconnectingPTYRequest is sent from the client to the server
@@ -106,7 +127,7 @@ type ReconnectingPTYRequest struct {
 // ReconnectingPTY spawns a new reconnecting terminal session.
 // `ReconnectingPTYRequest` should be JSON marshaled and written to the returned net.Conn.
 // Raw terminal output will be read from the returned net.Conn.
-func (c *AgentConn) ReconnectingPTY(ctx context.Context, id uuid.UUID, height, width uint16, command string) (net.Conn, error) {
+func (c *AgentConn) ReconnectingPTY(ctx context.Context, id uuid.UUID, height, width uint16, command string, initOpts ...AgentReconnectingPTYInitOption) (net.Conn, error) {
 	ctx, span := tracing.StartSpan(ctx)
 	defer span.End()
 
@@ -118,17 +139,22 @@ func (c *AgentConn) ReconnectingPTY(ctx context.Context, id uuid.UUID, height, w
 	if err != nil {
 		return nil, err
 	}
-	data, err := json.Marshal(AgentReconnectingPTYInit{
+	rptyInit := AgentReconnectingPTYInit{
 		ID:      id,
 		Height:  height,
 		Width:   width,
 		Command: command,
-	})
+	}
+	for _, o := range initOpts {
+		o(&rptyInit)
+	}
+	data, err := json.Marshal(rptyInit)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
 	data = append(make([]byte, 2), data...)
+	// #nosec G115 - Safe conversion as the data length is expected to be within uint16 range for PTY initialization
 	binary.LittleEndian.PutUint16(data, uint16(len(data)-2))
 
 	_, err = conn.Write(data)
@@ -142,6 +168,12 @@ func (c *AgentConn) ReconnectingPTY(ctx context.Context, id uuid.UUID, height, w
 // SSH pipes the SSH protocol over the returned net.Conn.
 // This connects to the built-in SSH server in the workspace agent.
 func (c *AgentConn) SSH(ctx context.Context) (*gonet.TCPConn, error) {
+	return c.SSHOnPort(ctx, AgentSSHPort)
+}
+
+// SSHOnPort pipes the SSH protocol over the returned net.Conn.
+// This connects to the built-in SSH server in the workspace agent on the specified port.
+func (c *AgentConn) SSHOnPort(ctx context.Context, port uint16) (*gonet.TCPConn, error) {
 	ctx, span := tracing.StartSpan(ctx)
 	defer span.End()
 
@@ -149,17 +181,23 @@ func (c *AgentConn) SSH(ctx context.Context) (*gonet.TCPConn, error) {
 		return nil, xerrors.Errorf("workspace agent not reachable in time: %v", ctx.Err())
 	}
 
-	c.Conn.SendConnectedTelemetry(c.agentAddress(), tailnet.TelemetryApplicationSSH)
-	return c.Conn.DialContextTCP(ctx, netip.AddrPortFrom(c.agentAddress(), AgentSSHPort))
+	c.SendConnectedTelemetry(c.agentAddress(), tailnet.TelemetryApplicationSSH)
+	return c.DialContextTCP(ctx, netip.AddrPortFrom(c.agentAddress(), port))
 }
 
 // SSHClient calls SSH to create a client that uses a weak cipher
 // to improve throughput.
 func (c *AgentConn) SSHClient(ctx context.Context) (*ssh.Client, error) {
+	return c.SSHClientOnPort(ctx, AgentSSHPort)
+}
+
+// SSHClientOnPort calls SSH to create a client on a specific port
+// that uses a weak cipher to improve throughput.
+func (c *AgentConn) SSHClientOnPort(ctx context.Context, port uint16) (*ssh.Client, error) {
 	ctx, span := tracing.StartSpan(ctx)
 	defer span.End()
 
-	netConn, err := c.SSH(ctx)
+	netConn, err := c.SSHOnPort(ctx, port)
 	if err != nil {
 		return nil, xerrors.Errorf("ssh: %w", err)
 	}
@@ -241,6 +279,23 @@ func (c *AgentConn) ListeningPorts(ctx context.Context) (codersdk.WorkspaceAgent
 	return resp, json.NewDecoder(res.Body).Decode(&resp)
 }
 
+// Netcheck returns a network check report from the workspace agent.
+func (c *AgentConn) Netcheck(ctx context.Context) (healthsdk.AgentNetcheckReport, error) {
+	ctx, span := tracing.StartSpan(ctx)
+	defer span.End()
+	res, err := c.apiRequest(ctx, http.MethodGet, "/api/v0/netcheck", nil)
+	if err != nil {
+		return healthsdk.AgentNetcheckReport{}, xerrors.Errorf("do request: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return healthsdk.AgentNetcheckReport{}, codersdk.ReadBodyAsError(res)
+	}
+
+	var resp healthsdk.AgentNetcheckReport
+	return resp, json.NewDecoder(res.Body).Decode(&resp)
+}
+
 // DebugMagicsock makes a request to the workspace agent's magicsock debug endpoint.
 func (c *AgentConn) DebugMagicsock(ctx context.Context) ([]byte, error) {
 	ctx, span := tracing.StartSpan(ctx)
@@ -316,6 +371,22 @@ func (c *AgentConn) PrometheusMetrics(ctx context.Context) ([]byte, error) {
 		return nil, xerrors.Errorf("read response body: %w", err)
 	}
 	return bs, nil
+}
+
+// ListContainers returns a response from the agent's containers endpoint
+func (c *AgentConn) ListContainers(ctx context.Context) (codersdk.WorkspaceAgentListContainersResponse, error) {
+	ctx, span := tracing.StartSpan(ctx)
+	defer span.End()
+	res, err := c.apiRequest(ctx, http.MethodGet, "/api/v0/containers", nil)
+	if err != nil {
+		return codersdk.WorkspaceAgentListContainersResponse{}, xerrors.Errorf("do request: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return codersdk.WorkspaceAgentListContainersResponse{}, codersdk.ReadBodyAsError(res)
+	}
+	var resp codersdk.WorkspaceAgentListContainersResponse
+	return resp, json.NewDecoder(res.Body).Decode(&resp)
 }
 
 // apiRequest makes a request to the workspace agent's HTTP API server.

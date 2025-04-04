@@ -151,7 +151,7 @@ func VerifySwaggerDefinitions(t *testing.T, router chi.Router, swaggerComments [
 	assertUniqueRoutes(t, swaggerComments)
 	assertSingleAnnotations(t, swaggerComments)
 
-	err := chi.Walk(router, func(method, route string, handler http.Handler, middlewares ...func(http.Handler) http.Handler) error {
+	err := chi.Walk(router, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 		method = strings.ToLower(method)
 		if route != "/" && strings.HasSuffix(route, "/") {
 			route = route[:len(route)-1]
@@ -300,13 +300,20 @@ func assertPathParametersDefined(t *testing.T, comment SwaggerComment) {
 }
 
 func assertSecurityDefined(t *testing.T, comment SwaggerComment) {
+	authorizedSecurityTags := []string{
+		"CoderSessionToken",
+		"CoderProvisionerKey",
+	}
+
 	if comment.router == "/updatecheck" ||
 		comment.router == "/buildinfo" ||
 		comment.router == "/" ||
-		comment.router == "/users/login" {
+		comment.router == "/users/login" ||
+		comment.router == "/users/otp/request" ||
+		comment.router == "/users/otp/change-password" {
 		return // endpoints do not require authorization
 	}
-	assert.Equal(t, "CoderSessionToken", comment.security, "@Security must be equal CoderSessionToken")
+	assert.Containsf(t, authorizedSecurityTags, comment.security, "@Security must be either of these options: %v", authorizedSecurityTags)
 }
 
 func assertAccept(t *testing.T, comment SwaggerComment) {

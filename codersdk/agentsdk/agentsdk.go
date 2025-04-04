@@ -15,7 +15,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/hashicorp/yamux"
 	"golang.org/x/xerrors"
-	"nhooyr.io/websocket"
 	"storj.io/drpc"
 	"tailscale.com/tailcfg"
 
@@ -24,6 +23,8 @@ import (
 	"github.com/coder/coder/v2/apiversion"
 	"github.com/coder/coder/v2/codersdk"
 	drpcsdk "github.com/coder/coder/v2/codersdk/drpc"
+	tailnetproto "github.com/coder/coder/v2/tailnet/proto"
+	"github.com/coder/websocket"
 )
 
 // ExternalLogSourceID is the statically-defined ID of a log-source that
@@ -32,6 +33,18 @@ import (
 // This is to support legacy API-consumers that do not create their own
 // log-source. This should be removed in the future.
 var ExternalLogSourceID = uuid.MustParse("3b579bf4-1ed8-4b99-87a8-e9a1e3410410")
+
+// ConnectionType is the type of connection that the agent is receiving.
+type ConnectionType string
+
+// Connection type enums.
+const (
+	ConnectionTypeUnspecified     ConnectionType = "Unspecified"
+	ConnectionTypeSSH             ConnectionType = "SSH"
+	ConnectionTypeVSCode          ConnectionType = "VS Code"
+	ConnectionTypeJetBrains       ConnectionType = "JetBrains"
+	ConnectionTypeReconnectingPTY ConnectionType = "Web Terminal"
+)
 
 // New returns a client that is used to interact with the
 // Coder API from a workspace agent.
@@ -108,6 +121,7 @@ type Manifest struct {
 	DisableDirectConnections bool                                         `json:"disable_direct_connections"`
 	Metadata                 []codersdk.WorkspaceAgentMetadataDescription `json:"metadata"`
 	Scripts                  []codersdk.WorkspaceAgentScript              `json:"scripts"`
+	Devcontainers            []codersdk.WorkspaceAgentDevcontainer        `json:"devcontainers"`
 }
 
 type LogSource struct {
@@ -159,6 +173,7 @@ func (c *Client) RewriteDERPMap(derpMap *tailcfg.DERPMap) {
 // ConnectRPC20 returns a dRPC client to the Agent API v2.0.  Notably, it is missing
 // GetAnnouncementBanners, but is useful when you want to be maximally compatible with Coderd
 // Release Versions from 2.9+
+// Deprecated: use ConnectRPC20WithTailnet
 func (c *Client) ConnectRPC20(ctx context.Context) (proto.DRPCAgentClient20, error) {
 	conn, err := c.connectRPCVersion(ctx, apiversion.New(2, 0))
 	if err != nil {
@@ -167,14 +182,76 @@ func (c *Client) ConnectRPC20(ctx context.Context) (proto.DRPCAgentClient20, err
 	return proto.NewDRPCAgentClient(conn), nil
 }
 
+// ConnectRPC20WithTailnet returns a dRPC client to the Agent API v2.0.  Notably, it is missing
+// GetAnnouncementBanners, but is useful when you want to be maximally compatible with Coderd
+// Release Versions from 2.9+
+func (c *Client) ConnectRPC20WithTailnet(ctx context.Context) (
+	proto.DRPCAgentClient20, tailnetproto.DRPCTailnetClient20, error,
+) {
+	conn, err := c.connectRPCVersion(ctx, apiversion.New(2, 0))
+	if err != nil {
+		return nil, nil, err
+	}
+	return proto.NewDRPCAgentClient(conn), tailnetproto.NewDRPCTailnetClient(conn), nil
+}
+
 // ConnectRPC21 returns a dRPC client to the Agent API v2.1.  It is useful when you want to be
 // maximally compatible with Coderd Release Versions from 2.12+
+// Deprecated: use ConnectRPC21WithTailnet
 func (c *Client) ConnectRPC21(ctx context.Context) (proto.DRPCAgentClient21, error) {
 	conn, err := c.connectRPCVersion(ctx, apiversion.New(2, 1))
 	if err != nil {
 		return nil, err
 	}
 	return proto.NewDRPCAgentClient(conn), nil
+}
+
+// ConnectRPC21WithTailnet returns a dRPC client to the Agent API v2.1.  It is useful when you want to be
+// maximally compatible with Coderd Release Versions from 2.12+
+func (c *Client) ConnectRPC21WithTailnet(ctx context.Context) (
+	proto.DRPCAgentClient21, tailnetproto.DRPCTailnetClient21, error,
+) {
+	conn, err := c.connectRPCVersion(ctx, apiversion.New(2, 1))
+	if err != nil {
+		return nil, nil, err
+	}
+	return proto.NewDRPCAgentClient(conn), tailnetproto.NewDRPCTailnetClient(conn), nil
+}
+
+// ConnectRPC22 returns a dRPC client to the Agent API v2.2.  It is useful when you want to be
+// maximally compatible with Coderd Release Versions from 2.13+
+func (c *Client) ConnectRPC22(ctx context.Context) (
+	proto.DRPCAgentClient22, tailnetproto.DRPCTailnetClient22, error,
+) {
+	conn, err := c.connectRPCVersion(ctx, apiversion.New(2, 2))
+	if err != nil {
+		return nil, nil, err
+	}
+	return proto.NewDRPCAgentClient(conn), tailnetproto.NewDRPCTailnetClient(conn), nil
+}
+
+// ConnectRPC23 returns a dRPC client to the Agent API v2.3.  It is useful when you want to be
+// maximally compatible with Coderd Release Versions from 2.18+
+func (c *Client) ConnectRPC23(ctx context.Context) (
+	proto.DRPCAgentClient23, tailnetproto.DRPCTailnetClient23, error,
+) {
+	conn, err := c.connectRPCVersion(ctx, apiversion.New(2, 3))
+	if err != nil {
+		return nil, nil, err
+	}
+	return proto.NewDRPCAgentClient(conn), tailnetproto.NewDRPCTailnetClient(conn), nil
+}
+
+// ConnectRPC24 returns a dRPC client to the Agent API v2.4.  It is useful when you want to be
+// maximally compatible with Coderd Release Versions from 2.xx+ // TODO @vincent: define version
+func (c *Client) ConnectRPC24(ctx context.Context) (
+	proto.DRPCAgentClient24, tailnetproto.DRPCTailnetClient24, error,
+) {
+	conn, err := c.connectRPCVersion(ctx, apiversion.New(2, 4))
+	if err != nil {
+		return nil, nil, err
+	}
+	return proto.NewDRPCAgentClient(conn), tailnetproto.NewDRPCTailnetClient(conn), nil
 }
 
 // ConnectRPC connects to the workspace agent API and tailnet API
@@ -494,6 +571,28 @@ type PatchLogs struct {
 // Deprecated: use the DRPCAgentClient.BatchCreateLogs instead
 func (c *Client) PatchLogs(ctx context.Context, req PatchLogs) error {
 	res, err := c.SDK.Request(ctx, http.MethodPatch, "/api/v2/workspaceagents/me/logs", req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return codersdk.ReadBodyAsError(res)
+	}
+	return nil
+}
+
+// PatchAppStatus updates the status of a workspace app.
+type PatchAppStatus struct {
+	AppSlug            string                           `json:"app_slug"`
+	NeedsUserAttention bool                             `json:"needs_user_attention"`
+	State              codersdk.WorkspaceAppStatusState `json:"state"`
+	Message            string                           `json:"message"`
+	URI                string                           `json:"uri"`
+	Icon               string                           `json:"icon"`
+}
+
+func (c *Client) PatchAppStatus(ctx context.Context, req PatchAppStatus) error {
+	res, err := c.SDK.Request(ctx, http.MethodPatch, "/api/v2/workspaceagents/me/app-status", req)
 	if err != nil {
 		return err
 	}

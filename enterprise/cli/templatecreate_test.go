@@ -139,14 +139,8 @@ func TestTemplateCreate(t *testing.T) {
 	t.Run("SecondOrganization", func(t *testing.T) {
 		t.Parallel()
 
-		dv := coderdtest.DeploymentValues(t)
-		dv.Experiments = []string{
-			string(codersdk.ExperimentCustomRoles),
-			string(codersdk.ExperimentMultiOrganization),
-		}
 		ownerClient, _ := coderdenttest.New(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
-				DeploymentValues: dv,
 				// This only affects the first org.
 				IncludeProvisionerDaemon: false,
 			},
@@ -168,7 +162,7 @@ func TestTemplateCreate(t *testing.T) {
 		ctx := testutil.Context(t, testutil.WaitMedium)
 
 		//nolint:gocritic // owner required to make custom roles
-		orgTemplateAdminRole, err := ownerClient.PatchOrganizationRole(ctx, secondOrg.ID, codersdk.Role{
+		orgTemplateAdminRole, err := ownerClient.CreateOrganizationRole(ctx, codersdk.Role{
 			Name:           "org-template-admin",
 			OrganizationID: secondOrg.ID.String(),
 			OrganizationPermissions: codersdk.CreatePermissions(map[codersdk.RBACResource][]codersdk.RBACAction{

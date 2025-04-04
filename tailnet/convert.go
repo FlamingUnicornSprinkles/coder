@@ -9,6 +9,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 
+	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/tailnet/proto"
 )
 
@@ -30,6 +31,7 @@ func NodeToProto(n *Node) (*proto.Node, error) {
 	}
 	derpForcedWebsocket := make(map[int32]string)
 	for i, s := range n.DERPForcedWebsocket {
+		// #nosec G115 - Safe conversion for DERP region IDs which are small positive integers
 		derpForcedWebsocket[int32(i)] = s
 	}
 	addresses := make([]string, len(n.Addresses))
@@ -49,10 +51,11 @@ func NodeToProto(n *Node) (*proto.Node, error) {
 		allowedIPs[i] = string(s)
 	}
 	return &proto.Node{
-		Id:                  int64(n.ID),
-		AsOf:                timestamppb.New(n.AsOf),
-		Key:                 k,
-		Disco:               string(disco),
+		Id:    int64(n.ID),
+		AsOf:  timestamppb.New(n.AsOf),
+		Key:   k,
+		Disco: string(disco),
+		// #nosec G115 - Safe conversion as DERP region IDs are small integers expected to be within int32 range
 		PreferredDerp:       int32(n.PreferredDERP),
 		DerpLatency:         n.DERPLatency,
 		DerpForcedWebsocket: derpForcedWebsocket,
@@ -189,14 +192,16 @@ func DERPNodeToProto(node *tailcfg.DERPNode) *proto.DERPMap_Region_Node {
 	}
 
 	return &proto.DERPMap_Region_Node{
-		Name:             node.Name,
-		RegionId:         int64(node.RegionID),
-		HostName:         node.HostName,
-		CertName:         node.CertName,
-		Ipv4:             node.IPv4,
-		Ipv6:             node.IPv6,
-		StunPort:         int32(node.STUNPort),
-		StunOnly:         node.STUNOnly,
+		Name:     node.Name,
+		RegionId: int64(node.RegionID),
+		HostName: node.HostName,
+		CertName: node.CertName,
+		Ipv4:     node.IPv4,
+		Ipv6:     node.IPv6,
+		// #nosec G115 - Safe conversion as STUN port is within int32 range (0-65535)
+		StunPort: int32(node.STUNPort),
+		StunOnly: node.STUNOnly,
+		// #nosec G115 - Safe conversion as DERP port is within int32 range (0-65535)
 		DerpPort:         int32(node.DERPPort),
 		InsecureForTests: node.InsecureForTests,
 		ForceHttp:        node.ForceHTTP,
@@ -270,3 +275,48 @@ func DERPNodeFromProto(node *proto.DERPMap_Region_Node) *tailcfg.DERPNode {
 		CanPort80:        node.CanPort_80,
 	}
 }
+
+func WorkspaceStatusToProto(status codersdk.WorkspaceStatus) proto.Workspace_Status {
+	switch status {
+	case codersdk.WorkspaceStatusCanceled:
+		return proto.Workspace_CANCELED
+	case codersdk.WorkspaceStatusCanceling:
+		return proto.Workspace_CANCELING
+	case codersdk.WorkspaceStatusDeleted:
+		return proto.Workspace_DELETED
+	case codersdk.WorkspaceStatusDeleting:
+		return proto.Workspace_DELETING
+	case codersdk.WorkspaceStatusFailed:
+		return proto.Workspace_FAILED
+	case codersdk.WorkspaceStatusPending:
+		return proto.Workspace_PENDING
+	case codersdk.WorkspaceStatusRunning:
+		return proto.Workspace_RUNNING
+	case codersdk.WorkspaceStatusStarting:
+		return proto.Workspace_STARTING
+	case codersdk.WorkspaceStatusStopped:
+		return proto.Workspace_STOPPED
+	case codersdk.WorkspaceStatusStopping:
+		return proto.Workspace_STOPPING
+	default:
+		return proto.Workspace_UNKNOWN
+	}
+}
+
+type DERPFromDRPCWrapper struct {
+	Client proto.DRPCTailnet_StreamDERPMapsClient
+}
+
+func (w *DERPFromDRPCWrapper) Close() error {
+	return w.Client.Close()
+}
+
+func (w *DERPFromDRPCWrapper) Recv() (*tailcfg.DERPMap, error) {
+	p, err := w.Client.Recv()
+	if err != nil {
+		return nil, err
+	}
+	return DERPMapFromProto(p), nil
+}
+
+var _ DERPClient = &DERPFromDRPCWrapper{}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	agpl "github.com/coder/coder/v2/coderd"
 	"github.com/coder/coder/v2/coderd/audit"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/db2sdk"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/coderd/httpapi"
@@ -31,6 +33,13 @@ import (
 	"github.com/coder/coder/v2/enterprise/replicasync"
 	"github.com/coder/coder/v2/enterprise/wsproxy/wsproxysdk"
 )
+
+// whitelistedCryptoKeyFeatures is a list of crypto key features that are
+// allowed to be queried with workspace proxies.
+var whitelistedCryptoKeyFeatures = []database.CryptoKeyFeature{
+	database.CryptoKeyFeatureWorkspaceAppsToken,
+	database.CryptoKeyFeatureWorkspaceAppsAPIKey,
+}
 
 // forceWorkspaceProxyHealthUpdate forces an update of the proxy health.
 // This is useful when a proxy is created or deleted. Errors will be logged.
@@ -596,6 +605,7 @@ func (api *API) workspaceProxyRegister(rw http.ResponseWriter, r *http.Request) 
 	}
 
 	startingRegionID, _ := getProxyDERPStartingRegionID(api.Options.BaseDERPMap)
+	// #nosec G115 - Safe conversion as DERP region IDs are small integers expected to be within int32 range
 	regionID := int32(startingRegionID) + proxy.RegionID
 
 	err := api.Database.InTx(func(db database.Store) error {
@@ -616,7 +626,8 @@ func (api *API) workspaceProxyRegister(rw http.ResponseWriter, r *http.Request) 
 		// it if it exists. If it doesn't exist, create it.
 		now := time.Now()
 		replica, err := db.GetReplicaByID(ctx, req.ReplicaID)
-		if err == nil {
+		switch {
+		case err == nil:
 			// Replica exists, update it.
 			if replica.StoppedAt.Valid && !replica.StartedAt.IsZero() {
 				// If the replica deregistered, it shouldn't be able to
@@ -641,7 +652,7 @@ func (api *API) workspaceProxyRegister(rw http.ResponseWriter, r *http.Request) 
 			if err != nil {
 				return xerrors.Errorf("update replica: %w", err)
 			}
-		} else if xerrors.Is(err, sql.ErrNoRows) {
+		case xerrors.Is(err, sql.ErrNoRows):
 			// Replica doesn't exist, create it.
 			replica, err = db.InsertReplica(ctx, database.InsertReplicaParams{
 				ID:              req.ReplicaID,
@@ -658,7 +669,7 @@ func (api *API) workspaceProxyRegister(rw http.ResponseWriter, r *http.Request) 
 			if err != nil {
 				return xerrors.Errorf("insert replica: %w", err)
 			}
-		} else {
+		default:
 			return xerrors.Errorf("get replica: %w", err)
 		}
 
@@ -699,7 +710,6 @@ func (api *API) workspaceProxyRegister(rw http.ResponseWriter, r *http.Request) 
 	}
 
 	httpapi.Write(ctx, rw, http.StatusCreated, wsproxysdk.RegisterWorkspaceProxyResponse{
-		AppSecurityKey:      api.AppSecurityKey.String(),
 		DERPMeshKey:         api.DERPServer.MeshKey(),
 		DERPRegionID:        regionID,
 		DERPMap:             api.AGPL.DERPMap(),
@@ -708,6 +718,49 @@ func (api *API) workspaceProxyRegister(rw http.ResponseWriter, r *http.Request) 
 	})
 
 	go api.forceWorkspaceProxyHealthUpdate(api.ctx)
+}
+
+// workspaceProxyCryptoKeys is used to fetch signing keys for the workspace proxy.
+//
+// This is called periodically by the proxy in the background (every 10m per
+// replica) to ensure that the proxy has the latest signing keys.
+//
+// @Summary Get workspace proxy crypto keys
+// @ID get-workspace-proxy-crypto-keys
+// @Security CoderSessionToken
+// @Produce json
+// @Tags Enterprise
+// @Param feature query string true "Feature key"
+// @Success 200 {object} wsproxysdk.CryptoKeysResponse
+// @Router /workspaceproxies/me/crypto-keys [get]
+// @x-apidocgen {"skip": true}
+func (api *API) workspaceProxyCryptoKeys(rw http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	feature := database.CryptoKeyFeature(r.URL.Query().Get("feature"))
+	if feature == "" {
+		httpapi.Write(r.Context(), rw, http.StatusBadRequest, codersdk.Response{
+			Message: "Missing feature query parameter.",
+		})
+		return
+	}
+
+	if !slices.Contains(whitelistedCryptoKeyFeatures, feature) {
+		httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
+			Message: fmt.Sprintf("Invalid feature: %q", feature),
+		})
+		return
+	}
+
+	keys, err := api.Database.GetCryptoKeysByFeature(ctx, feature)
+	if err != nil {
+		httpapi.InternalServerError(rw, err)
+		return
+	}
+
+	httpapi.Write(ctx, rw, http.StatusOK, wsproxysdk.CryptoKeysResponse{
+		CryptoKeys: db2sdk.CryptoKeys(keys),
+	})
 }
 
 // @Summary Deregister workspace proxy

@@ -4,13 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
-	"golang.org/x/exp/slices"
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
@@ -130,8 +130,8 @@ func (a *Acquirer) AcquireJob(
 					UUID:  worker,
 					Valid: true,
 				},
-				Types: pt,
-				Tags:  dbTags,
+				Types:           pt,
+				ProvisionerTags: dbTags,
 			})
 			if xerrors.Is(err, sql.ErrNoRows) {
 				logger.Debug(ctx, "no job available")

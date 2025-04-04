@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/trace"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,7 +26,6 @@ import (
 
 	"github.com/mattn/go-isatty"
 	"github.com/mitchellh/go-wordwrap"
-	"golang.org/x/exp/slices"
 	"golang.org/x/mod/semver"
 	"golang.org/x/xerrors"
 
@@ -82,6 +82,7 @@ const (
 func (r *RootCmd) CoreSubcommands() []*serpent.Command {
 	// Please re-sort this list alphabetically if you change it!
 	return []*serpent.Command{
+		r.completion(),
 		r.dotfiles(),
 		r.externalAuth(),
 		r.login(),
@@ -124,13 +125,18 @@ func (r *RootCmd) CoreSubcommands() []*serpent.Command {
 		r.expCmd(),
 		r.gitssh(),
 		r.support(),
+		r.vpnDaemon(),
 		r.vscodeSSH(),
 		r.workspaceAgent(),
 	}
 }
 
 func (r *RootCmd) AGPL() []*serpent.Command {
-	all := append(r.CoreSubcommands(), r.Server( /* Do not import coderd here. */ nil))
+	all := append(
+		r.CoreSubcommands(),
+		r.Server( /* Do not import coderd here. */ nil),
+		r.Provisioners(),
+	)
 	return all
 }
 
@@ -165,15 +171,15 @@ func (r *RootCmd) RunWithSubcommands(subcommands []*serpent.Command) {
 			code = exitErr.code
 			err = exitErr.err
 		}
-		if errors.Is(err, cliui.Canceled) {
-			//nolint:revive
+		if errors.Is(err, cliui.ErrCanceled) {
+			//nolint:revive,gocritic
 			os.Exit(code)
 		}
 		f := PrettyErrorFormatter{w: os.Stderr, verbose: r.verbose}
 		if err != nil {
 			f.Format(err)
 		}
-		//nolint:revive
+		//nolint:revive,gocritic
 		os.Exit(code)
 	}
 }
@@ -255,7 +261,7 @@ func (r *RootCmd) Command(subcommands []*serpent.Command) (*serpent.Command, err
 		cmd.Use = fmt.Sprintf("%s %s %s", tokens[0], flags, tokens[1])
 	})
 
-	// Add alises when appropriate.
+	// Add aliases when appropriate.
 	cmd.Walk(func(cmd *serpent.Command) {
 		// TODO: we should really be consistent about naming.
 		if cmd.Name() == "delete" || cmd.Name() == "remove" {
@@ -320,6 +326,15 @@ func (r *RootCmd) Command(subcommands []*serpent.Command) (*serpent.Command, err
 			}
 			tw.Flush()
 			return nil
+		}
+	})
+
+	// Add the PrintDeprecatedOptions middleware to all commands.
+	cmd.Walk(func(cmd *serpent.Command) {
+		if cmd.Middleware == nil {
+			cmd.Middleware = PrintDeprecatedOptions()
+		} else {
+			cmd.Middleware = serpent.Chain(cmd.Middleware, PrintDeprecatedOptions())
 		}
 	})
 
@@ -410,7 +425,7 @@ func (r *RootCmd) Command(subcommands []*serpent.Command) (*serpent.Command, err
 		{
 			Flag:        varNoOpen,
 			Env:         "CODER_NO_OPEN",
-			Description: "Suppress opening the browser after logging in.",
+			Description: "Suppress opening the browser when logging in, or starting the server.",
 			Value:       serpent.BoolOf(&r.noOpen),
 			Hidden:      true,
 			Group:       globalGroup,
@@ -418,7 +433,7 @@ func (r *RootCmd) Command(subcommands []*serpent.Command) (*serpent.Command, err
 		{
 			Flag:        varForceTty,
 			Env:         "CODER_FORCE_TTY",
-			Hidden:      true,
+			Hidden:      false,
 			Description: "Force the use of a TTY.",
 			Value:       serpent.BoolOf(&r.forceTTY),
 			Group:       globalGroup,
@@ -549,44 +564,7 @@ func (r *RootCmd) InitClient(client *codersdk.Client) serpent.MiddlewareFunc {
 // HeaderTransport creates a new transport that executes `--header-command`
 // if it is set to add headers for all outbound requests.
 func (r *RootCmd) HeaderTransport(ctx context.Context, serverURL *url.URL) (*codersdk.HeaderTransport, error) {
-	transport := &codersdk.HeaderTransport{
-		Transport: http.DefaultTransport,
-		Header:    http.Header{},
-	}
-	headers := r.header
-	if r.headerCommand != "" {
-		shell := "sh"
-		caller := "-c"
-		if runtime.GOOS == "windows" {
-			shell = "cmd.exe"
-			caller = "/c"
-		}
-		var outBuf bytes.Buffer
-		// #nosec
-		cmd := exec.CommandContext(ctx, shell, caller, r.headerCommand)
-		cmd.Env = append(os.Environ(), "CODER_URL="+serverURL.String())
-		cmd.Stdout = &outBuf
-		cmd.Stderr = io.Discard
-		err := cmd.Run()
-		if err != nil {
-			return nil, xerrors.Errorf("failed to run %v: %w", cmd.Args, err)
-		}
-		scanner := bufio.NewScanner(&outBuf)
-		for scanner.Scan() {
-			headers = append(headers, scanner.Text())
-		}
-		if err := scanner.Err(); err != nil {
-			return nil, xerrors.Errorf("scan %v: %w", cmd.Args, err)
-		}
-	}
-	for _, header := range headers {
-		parts := strings.SplitN(header, "=", 2)
-		if len(parts) < 2 {
-			return nil, xerrors.Errorf("split header %q had less than two parts", header)
-		}
-		transport.Header.Add(parts[0], parts[1])
-	}
-	return transport, nil
+	return headerTransport(ctx, serverURL, r.header, r.headerCommand)
 }
 
 func (r *RootCmd) configureClient(ctx context.Context, client *codersdk.Client, serverURL *url.URL, inv *serpent.Invocation) error {
@@ -693,7 +671,12 @@ func (o *OrganizationContext) Selected(inv *serpent.Invocation, client *codersdk
 	}
 
 	// No org selected, and we are more than 1? Return an error.
-	return codersdk.Organization{}, xerrors.Errorf("Must select an organization with --org=<org_name>.")
+	validOrgs := make([]string, 0, len(orgs))
+	for _, org := range orgs {
+		validOrgs = append(validOrgs, org.Name)
+	}
+
+	return codersdk.Organization{}, xerrors.Errorf("Must select an organization with --org=<org_name>. Choose from: %s", strings.Join(validOrgs, ", "))
 }
 
 func splitNamedWorkspace(identifier string) (owner string, workspaceName string, err error) {
@@ -723,13 +706,26 @@ func namedWorkspace(ctx context.Context, client *codersdk.Client, identifier str
 	return client.WorkspaceByOwnerAndName(ctx, owner, name, codersdk.WorkspaceOptions{})
 }
 
+func initAppearance(client *codersdk.Client, outConfig *codersdk.AppearanceConfig) serpent.MiddlewareFunc {
+	return func(next serpent.HandlerFunc) serpent.HandlerFunc {
+		return func(inv *serpent.Invocation) error {
+			cfg, _ := client.Appearance(inv.Context())
+			if cfg.DocsURL == "" {
+				cfg.DocsURL = codersdk.DefaultDocsURL()
+			}
+			*outConfig = cfg
+			return next(inv)
+		}
+	}
+}
+
 // createConfig consumes the global configuration flag to produce a config root.
 func (r *RootCmd) createConfig() config.Root {
 	return config.Root(r.globalConfig)
 }
 
-// isTTY returns whether the passed reader is a TTY or not.
-func isTTY(inv *serpent.Invocation) bool {
+// isTTYIn returns whether the passed invocation is having stdin read from a TTY
+func isTTYIn(inv *serpent.Invocation) bool {
 	// If the `--force-tty` command is available, and set,
 	// assume we're in a tty. This is primarily for cases on Windows
 	// where we may not be able to reliably detect this automatically (ie, tests)
@@ -744,12 +740,12 @@ func isTTY(inv *serpent.Invocation) bool {
 	return isatty.IsTerminal(file.Fd())
 }
 
-// isTTYOut returns whether the passed reader is a TTY or not.
+// isTTYOut returns whether the passed invocation is having stdout written to a TTY
 func isTTYOut(inv *serpent.Invocation) bool {
 	return isTTYWriter(inv, inv.Stdout)
 }
 
-// isTTYErr returns whether the passed reader is a TTY or not.
+// isTTYErr returns whether the passed invocation is having stderr written to a TTY
 func isTTYErr(inv *serpent.Invocation) bool {
 	return isTTYWriter(inv, inv.Stderr)
 }
@@ -895,7 +891,7 @@ func DumpHandler(ctx context.Context, name string) {
 
 	done:
 		if sigStr == "SIGQUIT" {
-			//nolint:revive
+			//nolint:revive,gocritic
 			os.Exit(1)
 		}
 	}
@@ -1049,7 +1045,7 @@ func formatMultiError(from string, multi []error, opts *formatOpts) string {
 		prefix := fmt.Sprintf("%d. ", i+1)
 		if len(prefix) < len(indent) {
 			// Indent the prefix to match the indent
-			prefix = prefix + strings.Repeat(" ", len(indent)-len(prefix))
+			prefix += strings.Repeat(" ", len(indent)-len(prefix))
 		}
 		errStr = prefix + errStr
 		// Now looks like
@@ -1134,7 +1130,16 @@ func formatCoderSDKError(from string, err *codersdk.Error, opts *formatOpts) str
 //nolint:errorlint
 func traceError(err error) string {
 	if uw, ok := err.(interface{ Unwrap() error }); ok {
-		a, b := err.Error(), uw.Unwrap().Error()
+		var a, b string
+		if err != nil {
+			a = err.Error()
+		}
+		if uw != nil {
+			uwerr := uw.Unwrap()
+			if uwerr != nil {
+				b = uwerr.Error()
+			}
+		}
 		c := strings.TrimSuffix(a, b)
 		return c
 	}
@@ -1208,9 +1213,14 @@ func wrapTransportWithVersionMismatchCheck(rt http.RoundTripper, inv *serpent.In
 				return
 			}
 			upgradeMessage := defaultUpgradeMessage(semver.Canonical(serverVersion))
-			serverInfo, err := getBuildInfo(inv.Context())
-			if err == nil && serverInfo.UpgradeMessage != "" {
-				upgradeMessage = serverInfo.UpgradeMessage
+			if serverInfo, err := getBuildInfo(inv.Context()); err == nil {
+				switch {
+				case serverInfo.UpgradeMessage != "":
+					upgradeMessage = serverInfo.UpgradeMessage
+				// The site-local `install.sh` was introduced in v2.19.0
+				case serverInfo.DashboardURL != "" && semver.Compare(semver.MajorMinor(serverVersion), "v2.19") >= 0:
+					upgradeMessage = fmt.Sprintf("download %s with: 'curl -fsSL %s/install.sh | sh'", serverVersion, serverInfo.DashboardURL)
+				}
 			}
 			fmtWarningText := "version mismatch: client %s, server %s\n%s"
 			fmtWarn := pretty.Sprint(cliui.DefaultStyles.Warn, fmtWarningText)
@@ -1271,4 +1281,109 @@ type roundTripper func(req *http.Request) (*http.Response, error)
 
 func (r roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return r(req)
+}
+
+// HeaderTransport creates a new transport that executes `--header-command`
+// if it is set to add headers for all outbound requests.
+func headerTransport(ctx context.Context, serverURL *url.URL, header []string, headerCommand string) (*codersdk.HeaderTransport, error) {
+	transport := &codersdk.HeaderTransport{
+		Transport: http.DefaultTransport,
+		Header:    http.Header{},
+	}
+	headers := header
+	if headerCommand != "" {
+		shell := "sh"
+		caller := "-c"
+		if runtime.GOOS == "windows" {
+			shell = "cmd.exe"
+			caller = "/c"
+		}
+		var outBuf bytes.Buffer
+		// #nosec
+		cmd := exec.CommandContext(ctx, shell, caller, headerCommand)
+		cmd.Env = append(os.Environ(), "CODER_URL="+serverURL.String())
+		cmd.Stdout = &outBuf
+		cmd.Stderr = io.Discard
+		err := cmd.Run()
+		if err != nil {
+			return nil, xerrors.Errorf("failed to run %v: %w", cmd.Args, err)
+		}
+		scanner := bufio.NewScanner(&outBuf)
+		for scanner.Scan() {
+			headers = append(headers, scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, xerrors.Errorf("scan %v: %w", cmd.Args, err)
+		}
+	}
+	for _, header := range headers {
+		parts := strings.SplitN(header, "=", 2)
+		if len(parts) < 2 {
+			return nil, xerrors.Errorf("split header %q had less than two parts", header)
+		}
+		transport.Header.Add(parts[0], parts[1])
+	}
+	return transport, nil
+}
+
+// printDeprecatedOptions loops through all command options, and prints
+// a warning for usage of deprecated options.
+func PrintDeprecatedOptions() serpent.MiddlewareFunc {
+	return func(next serpent.HandlerFunc) serpent.HandlerFunc {
+		return func(inv *serpent.Invocation) error {
+			opts := inv.Command.Options
+			// Print deprecation warnings.
+			for _, opt := range opts {
+				if opt.UseInstead == nil {
+					continue
+				}
+
+				if opt.ValueSource == serpent.ValueSourceNone || opt.ValueSource == serpent.ValueSourceDefault {
+					continue
+				}
+
+				var warnStr strings.Builder
+				_, _ = warnStr.WriteString(translateSource(opt.ValueSource, opt))
+				_, _ = warnStr.WriteString(" is deprecated, please use ")
+				for i, use := range opt.UseInstead {
+					_, _ = warnStr.WriteString(translateSource(opt.ValueSource, use))
+					if i != len(opt.UseInstead)-1 {
+						_, _ = warnStr.WriteString(" and ")
+					}
+				}
+				_, _ = warnStr.WriteString(" instead.\n")
+
+				cliui.Warn(inv.Stderr,
+					warnStr.String(),
+				)
+			}
+
+			return next(inv)
+		}
+	}
+}
+
+// translateSource provides the name of the source of the option, depending on the
+// supplied target ValueSource.
+func translateSource(target serpent.ValueSource, opt serpent.Option) string {
+	switch target {
+	case serpent.ValueSourceFlag:
+		return fmt.Sprintf("`--%s`", opt.Flag)
+	case serpent.ValueSourceEnv:
+		return fmt.Sprintf("`%s`", opt.Env)
+	case serpent.ValueSourceYAML:
+		return fmt.Sprintf("`%s`", fullYamlName(opt))
+	default:
+		return opt.Name
+	}
+}
+
+func fullYamlName(opt serpent.Option) string {
+	var full strings.Builder
+	for _, name := range opt.Group.Ancestry() {
+		_, _ = full.WriteString(name.YAML)
+		_, _ = full.WriteString(".")
+	}
+	_, _ = full.WriteString(opt.YAML)
+	return full.String()
 }

@@ -3,6 +3,7 @@ package agentapi
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/url"
 	"strings"
 	"time"
@@ -29,11 +30,11 @@ type ManifestAPI struct {
 	ExternalAuthConfigs      []*externalauth.Config
 	DisableDirectConnections bool
 	DerpForceWebSockets      bool
+	WorkspaceID              uuid.UUID
 
-	AgentFn       func(context.Context) (database.WorkspaceAgent, error)
-	WorkspaceIDFn func(context.Context, *database.WorkspaceAgent) (uuid.UUID, error)
-	Database      database.Store
-	DerpMapFn     func() *tailcfg.DERPMap
+	AgentFn   func(context.Context) (database.WorkspaceAgent, error)
+	Database  database.Store
+	DerpMapFn func() *tailcfg.DERPMap
 }
 
 func (a *ManifestAPI) GetManifest(ctx context.Context, _ *agentproto.GetManifestRequest) (*agentproto.Manifest, error) {
@@ -41,17 +42,13 @@ func (a *ManifestAPI) GetManifest(ctx context.Context, _ *agentproto.GetManifest
 	if err != nil {
 		return nil, err
 	}
-	workspaceID, err := a.WorkspaceIDFn(ctx, &workspaceAgent)
-	if err != nil {
-		return nil, err
-	}
-
 	var (
-		dbApps    []database.WorkspaceApp
-		scripts   []database.WorkspaceAgentScript
-		metadata  []database.WorkspaceAgentMetadatum
-		workspace database.Workspace
-		owner     database.User
+		dbApps        []database.WorkspaceApp
+		scripts       []database.WorkspaceAgentScript
+		metadata      []database.WorkspaceAgentMetadatum
+		workspace     database.Workspace
+		owner         database.User
+		devcontainers []database.WorkspaceAgentDevcontainer
 	)
 
 	var eg errgroup.Group
@@ -75,7 +72,7 @@ func (a *ManifestAPI) GetManifest(ctx context.Context, _ *agentproto.GetManifest
 		return err
 	})
 	eg.Go(func() (err error) {
-		workspace, err = a.Database.GetWorkspaceByID(ctx, workspaceID)
+		workspace, err = a.Database.GetWorkspaceByID(ctx, a.WorkspaceID)
 		if err != nil {
 			return xerrors.Errorf("getting workspace by id: %w", err)
 		}
@@ -84,6 +81,13 @@ func (a *ManifestAPI) GetManifest(ctx context.Context, _ *agentproto.GetManifest
 			return xerrors.Errorf("getting workspace owner by id: %w", err)
 		}
 		return err
+	})
+	eg.Go(func() (err error) {
+		devcontainers, err = a.Database.GetWorkspaceAgentDevcontainersByAgentID(ctx, workspaceAgent.ID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		return nil
 	})
 	err = eg.Wait()
 	if err != nil {
@@ -130,10 +134,11 @@ func (a *ManifestAPI) GetManifest(ctx context.Context, _ *agentproto.GetManifest
 		DisableDirectConnections: a.DisableDirectConnections,
 		DerpForceWebsockets:      a.DerpForceWebSockets,
 
-		DerpMap:  tailnet.DERPMapToProto(a.DerpMapFn()),
-		Scripts:  dbAgentScriptsToProto(scripts),
-		Apps:     apps,
-		Metadata: dbAgentMetadataToProtoDescription(metadata),
+		DerpMap:       tailnet.DERPMapToProto(a.DerpMapFn()),
+		Scripts:       dbAgentScriptsToProto(scripts),
+		Apps:          apps,
+		Metadata:      dbAgentMetadataToProtoDescription(metadata),
+		Devcontainers: dbAgentDevcontainersToProto(devcontainers),
 	}, nil
 }
 
@@ -178,6 +183,7 @@ func dbAgentScriptsToProto(scripts []database.WorkspaceAgentScript) []*agentprot
 
 func dbAgentScriptToProto(script database.WorkspaceAgentScript) *agentproto.WorkspaceAgentScript {
 	return &agentproto.WorkspaceAgentScript{
+		Id:               script.ID[:],
 		LogSourceId:      script.LogSourceID[:],
 		LogPath:          script.LogPath,
 		Script:           script.Script,
@@ -229,5 +235,19 @@ func dbAppToProto(dbApp database.WorkspaceApp, agent database.WorkspaceAgent, ow
 			Threshold: dbApp.HealthcheckThreshold,
 		},
 		Health: agentproto.WorkspaceApp_Health(healthRaw),
+		Hidden: dbApp.Hidden,
 	}, nil
+}
+
+func dbAgentDevcontainersToProto(devcontainers []database.WorkspaceAgentDevcontainer) []*agentproto.WorkspaceAgentDevcontainer {
+	ret := make([]*agentproto.WorkspaceAgentDevcontainer, len(devcontainers))
+	for i, dc := range devcontainers {
+		ret[i] = &agentproto.WorkspaceAgentDevcontainer{
+			Id:              dc.ID[:],
+			Name:            dc.Name,
+			WorkspaceFolder: dc.WorkspaceFolder,
+			ConfigPath:      dc.ConfigPath,
+		}
+	}
+	return ret
 }

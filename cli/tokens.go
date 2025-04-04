@@ -3,9 +3,10 @@ package cli
 import (
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
-	"golang.org/x/exp/slices"
 	"golang.org/x/xerrors"
 
 	"github.com/coder/coder/v2/cli/cliui"
@@ -46,8 +47,9 @@ func (r *RootCmd) tokens() *serpent.Command {
 
 func (r *RootCmd) createToken() *serpent.Command {
 	var (
-		tokenLifetime time.Duration
+		tokenLifetime string
 		name          string
+		user          string
 	)
 	client := new(codersdk.Client)
 	cmd := &serpent.Command{
@@ -58,8 +60,34 @@ func (r *RootCmd) createToken() *serpent.Command {
 			r.InitClient(client),
 		),
 		Handler: func(inv *serpent.Invocation) error {
-			res, err := client.CreateToken(inv.Context(), codersdk.Me, codersdk.CreateTokenRequest{
-				Lifetime:  tokenLifetime,
+			userID := codersdk.Me
+			if user != "" {
+				userID = user
+			}
+
+			var parsedLifetime time.Duration
+			var err error
+
+			tokenConfig, err := client.GetTokenConfig(inv.Context(), userID)
+			if err != nil {
+				return xerrors.Errorf("get token config: %w", err)
+			}
+
+			if tokenLifetime == "" {
+				parsedLifetime = tokenConfig.MaxTokenLifetime
+			} else {
+				parsedLifetime, err = extendedParseDuration(tokenLifetime)
+				if err != nil {
+					return xerrors.Errorf("parse lifetime: %w", err)
+				}
+
+				if parsedLifetime > tokenConfig.MaxTokenLifetime {
+					return xerrors.Errorf("lifetime (%s) is greater than the maximum allowed lifetime (%s)", parsedLifetime, tokenConfig.MaxTokenLifetime)
+				}
+			}
+
+			res, err := client.CreateToken(inv.Context(), userID, codersdk.CreateTokenRequest{
+				Lifetime:  parsedLifetime,
 				TokenName: name,
 			})
 			if err != nil {
@@ -77,8 +105,7 @@ func (r *RootCmd) createToken() *serpent.Command {
 			Flag:        "lifetime",
 			Env:         "CODER_TOKEN_LIFETIME",
 			Description: "Specify a duration for the lifetime of the token.",
-			Default:     (time.Hour * 24 * 30).String(),
-			Value:       serpent.DurationOf(&tokenLifetime),
+			Value:       serpent.StringOf(&tokenLifetime),
 		},
 		{
 			Flag:          "name",
@@ -86,6 +113,13 @@ func (r *RootCmd) createToken() *serpent.Command {
 			Env:           "CODER_TOKEN_NAME",
 			Description:   "Specify a human-readable name.",
 			Value:         serpent.StringOf(&name),
+		},
+		{
+			Flag:          "user",
+			FlagShorthand: "u",
+			Env:           "CODER_TOKEN_USER",
+			Description:   "Specify the user to create the token for (Only works if logged in user is admin).",
+			Value:         serpent.StringOf(&user),
 		},
 	}
 
@@ -190,7 +224,7 @@ func (r *RootCmd) listTokens() *serpent.Command {
 func (r *RootCmd) removeToken() *serpent.Command {
 	client := new(codersdk.Client)
 	cmd := &serpent.Command{
-		Use:     "remove <name>",
+		Use:     "remove <name|id|token>",
 		Aliases: []string{"delete"},
 		Short:   "Delete a token",
 		Middleware: serpent.Chain(
@@ -200,7 +234,12 @@ func (r *RootCmd) removeToken() *serpent.Command {
 		Handler: func(inv *serpent.Invocation) error {
 			token, err := client.APIKeyByName(inv.Context(), codersdk.Me, inv.Args[0])
 			if err != nil {
-				return xerrors.Errorf("fetch api key by name %s: %w", inv.Args[0], err)
+				// If it's a token, we need to extract the ID
+				maybeID := strings.Split(inv.Args[0], "-")[0]
+				token, err = client.APIKeyByID(inv.Context(), codersdk.Me, maybeID)
+				if err != nil {
+					return xerrors.Errorf("fetch api key by name or id: %w", err)
+				}
 			}
 
 			err = client.DeleteAPIKey(inv.Context(), codersdk.Me, token.ID)

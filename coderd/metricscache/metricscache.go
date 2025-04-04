@@ -15,6 +15,7 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/codersdk"
+	"github.com/coder/quartz"
 	"github.com/coder/retry"
 )
 
@@ -26,6 +27,7 @@ import (
 type Cache struct {
 	database  database.Store
 	log       slog.Logger
+	clock     quartz.Clock
 	intervals Intervals
 
 	templateWorkspaceOwners  atomic.Pointer[map[uuid.UUID]int]
@@ -34,6 +36,10 @@ type Cache struct {
 
 	done   chan struct{}
 	cancel func()
+
+	// usage is a experiment flag to enable new workspace usage tracking behavior and will be
+	// removed when the experiment is complete.
+	usage bool
 }
 
 type Intervals struct {
@@ -41,7 +47,7 @@ type Intervals struct {
 	DeploymentStats    time.Duration
 }
 
-func New(db database.Store, log slog.Logger, intervals Intervals) *Cache {
+func New(db database.Store, log slog.Logger, clock quartz.Clock, intervals Intervals, usage bool) *Cache {
 	if intervals.TemplateBuildTimes <= 0 {
 		intervals.TemplateBuildTimes = time.Hour
 	}
@@ -51,11 +57,13 @@ func New(db database.Store, log slog.Logger, intervals Intervals) *Cache {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c := &Cache{
+		clock:     clock,
 		database:  db,
 		intervals: intervals,
 		log:       log,
 		done:      make(chan struct{}),
 		cancel:    cancel,
+		usage:     usage,
 	}
 	go func() {
 		var wg sync.WaitGroup
@@ -99,7 +107,7 @@ func (c *Cache) refreshTemplateBuildTimes(ctx context.Context) error {
 				Valid: true,
 			},
 			StartTime: sql.NullTime{
-				Time:  dbtime.Time(time.Now().AddDate(0, -30, 0)),
+				Time:  dbtime.Time(c.clock.Now().AddDate(0, 0, -30)),
 				Valid: true,
 			},
 		})
@@ -125,19 +133,33 @@ func (c *Cache) refreshTemplateBuildTimes(ctx context.Context) error {
 }
 
 func (c *Cache) refreshDeploymentStats(ctx context.Context) error {
-	from := dbtime.Now().Add(-15 * time.Minute)
-	agentStats, err := c.database.GetDeploymentWorkspaceAgentStats(ctx, from)
-	if err != nil {
-		return err
+	var (
+		from       = c.clock.Now().Add(-15 * time.Minute)
+		agentStats database.GetDeploymentWorkspaceAgentStatsRow
+		err        error
+	)
+
+	if c.usage {
+		agentUsageStats, err := c.database.GetDeploymentWorkspaceAgentUsageStats(ctx, from)
+		if err != nil {
+			return err
+		}
+		agentStats = database.GetDeploymentWorkspaceAgentStatsRow(agentUsageStats)
+	} else {
+		agentStats, err = c.database.GetDeploymentWorkspaceAgentStats(ctx, from)
+		if err != nil {
+			return err
+		}
 	}
+
 	workspaceStats, err := c.database.GetDeploymentWorkspaceStats(ctx)
 	if err != nil {
 		return err
 	}
 	c.deploymentStatsResponse.Store(&codersdk.DeploymentStats{
 		AggregatedFrom: from,
-		CollectedAt:    dbtime.Now(),
-		NextUpdateAt:   dbtime.Now().Add(c.intervals.DeploymentStats),
+		CollectedAt:    dbtime.Time(c.clock.Now()),
+		NextUpdateAt:   dbtime.Time(c.clock.Now().Add(c.intervals.DeploymentStats)),
 		Workspaces: codersdk.WorkspaceDeploymentStats{
 			Pending:  workspaceStats.PendingWorkspaces,
 			Building: workspaceStats.BuildingWorkspaces,

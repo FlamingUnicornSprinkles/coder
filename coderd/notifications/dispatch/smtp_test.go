@@ -2,11 +2,8 @@ package dispatch_test
 
 import (
 	"bytes"
-	"crypto/tls"
-	_ "embed"
 	"fmt"
 	"log"
-	"net"
 	"sync"
 	"testing"
 
@@ -22,13 +19,14 @@ import (
 	"github.com/coder/serpent"
 
 	"github.com/coder/coder/v2/coderd/notifications/dispatch"
+	"github.com/coder/coder/v2/coderd/notifications/dispatch/smtptest"
 	"github.com/coder/coder/v2/coderd/notifications/types"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/testutil"
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m, testutil.GoleakOptions...)
 }
 
 func TestSMTP(t *testing.T) {
@@ -47,9 +45,9 @@ func TestSMTP(t *testing.T) {
 		subject = "This is the subject"
 		body    = "This is the body"
 
-		caFile   = "fixtures/ca.crt"
-		certFile = "fixtures/server.crt"
-		keyFile  = "fixtures/server.key"
+		caFile   = "smtptest/fixtures/ca.crt"
+		certFile = "smtptest/fixtures/server.crt"
+		keyFile  = "smtptest/fixtures/server.key"
 	)
 
 	logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true, IgnoredErrorIs: []error{}}).Leveled(slog.LevelDebug)
@@ -62,6 +60,7 @@ func TestSMTP(t *testing.T) {
 		expectedErr      string
 		retryable        bool
 		useTLS           bool
+		failOnDataFn     func() error
 	}{
 		/**
 		 * LOGIN auth mechanism
@@ -124,7 +123,7 @@ func TestSMTP(t *testing.T) {
 
 				Auth: codersdk.NotificationsEmailAuthConfig{
 					Username:     username,
-					PasswordFile: "fixtures/password.txt",
+					PasswordFile: "smtptest/fixtures/password.txt",
 				},
 			},
 			toAddrs:          []string{to},
@@ -202,9 +201,18 @@ func TestSMTP(t *testing.T) {
 			retryable:        false,
 		},
 		{
-			// No auth, no problem!
 			name:      "No auth mechanisms supported, none configured",
 			authMechs: []string{},
+			cfg: codersdk.NotificationsEmailConfig{
+				Hello: hello,
+				From:  from,
+			},
+			toAddrs:          []string{to},
+			expectedAuthMeth: "",
+		},
+		{
+			name:      "Auth mechanisms supported optionally, none configured",
+			authMechs: []string{sasl.Login, sasl.Plain},
 			cfg: codersdk.NotificationsEmailConfig{
 				Hello: hello,
 				From:  from,
@@ -331,14 +339,14 @@ func TestSMTP(t *testing.T) {
 			cfg: codersdk.NotificationsEmailConfig{
 				TLS: codersdk.NotificationsEmailTLSConfig{
 					CAFile:   caFile,
-					CertFile: "fixtures/nope.cert",
+					CertFile: "smtptest/fixtures/nope.cert",
 					KeyFile:  keyFile,
 				},
 			},
 			// not using full error message here since it differs on *nix and Windows:
 			// *nix: no such file or directory
 			// Windows: The system cannot find the file specified.
-			expectedErr: "open fixtures/nope.cert:",
+			expectedErr: "open smtptest/fixtures/nope.cert:",
 			retryable:   true,
 		},
 		{
@@ -348,13 +356,13 @@ func TestSMTP(t *testing.T) {
 				TLS: codersdk.NotificationsEmailTLSConfig{
 					CAFile:   caFile,
 					CertFile: certFile,
-					KeyFile:  "fixtures/nope.key",
+					KeyFile:  "smtptest/fixtures/nope.key",
 				},
 			},
 			// not using full error message here since it differs on *nix and Windows:
 			// *nix: no such file or directory
 			// Windows: The system cannot find the file specified.
-			expectedErr: "open fixtures/nope.key:",
+			expectedErr: "open smtptest/fixtures/nope.key:",
 			retryable:   true,
 		},
 		/**
@@ -381,6 +389,21 @@ func TestSMTP(t *testing.T) {
 			toAddrs:          []string{to},
 			expectedAuthMeth: sasl.Plain,
 		},
+		/**
+		 * Other errors
+		 */
+		{
+			name: "Rejected on DATA",
+			cfg: codersdk.NotificationsEmailConfig{
+				Hello: hello,
+				From:  from,
+			},
+			failOnDataFn: func() error {
+				return &smtp.SMTPError{Code: 501, EnhancedCode: smtp.EnhancedCode{5, 5, 4}, Message: "Rejected!"}
+			},
+			expectedErr: "SMTP error 501: Rejected!",
+			retryable:   true,
+		},
 	}
 
 	// nolint:paralleltest // Reinitialization is not required as of Go v1.22.
@@ -392,16 +415,18 @@ func TestSMTP(t *testing.T) {
 
 			tc.cfg.ForceTLS = serpent.Bool(tc.useTLS)
 
-			backend := NewBackend(Config{
+			backend := smtptest.NewBackend(smtptest.Config{
 				AuthMechanisms: tc.authMechs,
 
 				AcceptedIdentity: tc.cfg.Auth.Identity.String(),
 				AcceptedUsername: username,
 				AcceptedPassword: password,
+
+				FailOnDataFn: tc.failOnDataFn,
 			})
 
 			// Create a mock SMTP server which conditionally listens for plain or TLS connections.
-			srv, listen, err := createMockSMTPServer(backend, tc.useTLS)
+			srv, listen, err := smtptest.CreateMockSMTPServer(backend, tc.useTLS)
 			require.NoError(t, err)
 			t.Cleanup(func() {
 				// We expect that the server has already been closed in the test
@@ -415,7 +440,7 @@ func TestSMTP(t *testing.T) {
 
 			var hp serpent.HostPort
 			require.NoError(t, hp.Set(listen.Addr().String()))
-			tc.cfg.Smarthost = hp
+			tc.cfg.Smarthost = serpent.String(hp.String())
 
 			handler := dispatch.NewSMTPHandler(tc.cfg, logger.Named("smtp"))
 
@@ -429,7 +454,7 @@ func TestSMTP(t *testing.T) {
 
 			// Wait for the server to become pingable.
 			require.Eventually(t, func() bool {
-				cl, err := pingClient(listen, tc.useTLS, tc.cfg.TLS.StartTLS.Value())
+				cl, err := smtptest.PingClient(listen, tc.useTLS, tc.cfg.TLS.StartTLS.Value())
 				if err != nil {
 					t.Logf("smtp not yet dialable: %s", err)
 					return false
@@ -455,7 +480,7 @@ func TestSMTP(t *testing.T) {
 				Labels:    make(map[string]string),
 			}
 
-			dispatchFn, err := handler.Dispatcher(payload, subject, body)
+			dispatchFn, err := handler.Dispatcher(payload, subject, body, helpers())
 			require.NoError(t, err)
 
 			msgID := uuid.New()
@@ -489,21 +514,5 @@ func TestSMTP(t *testing.T) {
 			require.NoError(t, srv.Shutdown(ctx))
 			wg.Wait()
 		})
-	}
-}
-
-func pingClient(listen net.Listener, useTLS bool, startTLS bool) (*smtp.Client, error) {
-	tlsCfg := &tls.Config{
-		// nolint:gosec // It's a test.
-		InsecureSkipVerify: true,
-	}
-
-	switch {
-	case useTLS:
-		return smtp.DialTLS(listen.Addr().String(), tlsCfg)
-	case startTLS:
-		return smtp.DialStartTLS(listen.Addr().String(), tlsCfg)
-	default:
-		return smtp.Dial(listen.Addr().String())
 	}
 }

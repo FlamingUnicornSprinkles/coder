@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 
 	"github.com/emersion/go-sasl"
@@ -33,11 +34,10 @@ import (
 )
 
 var (
-	ValidationNoFromAddressErr   = xerrors.New("no 'from' address defined")
-	ValidationNoToAddressErr     = xerrors.New("no 'to' address(es) defined")
-	ValidationNoSmarthostHostErr = xerrors.New("smarthost 'host' is not defined, or is invalid")
-	ValidationNoSmarthostPortErr = xerrors.New("smarthost 'port' is not defined, or is invalid")
-	ValidationNoHelloErr         = xerrors.New("'hello' not defined")
+	ErrValidationNoFromAddress = xerrors.New("'from' address not defined")
+	ErrValidationNoToAddress   = xerrors.New("'to' address(es) not defined")
+	ErrValidationNoSmarthost   = xerrors.New("'smarthost' address not defined")
+	ErrValidationNoHello       = xerrors.New("'hello' not defined")
 
 	//go:embed smtp/html.gotmpl
 	htmlTemplate string
@@ -52,14 +52,15 @@ type SMTPHandler struct {
 	cfg codersdk.NotificationsEmailConfig
 	log slog.Logger
 
-	loginWarnOnce sync.Once
+	noAuthWarnOnce sync.Once
+	loginWarnOnce  sync.Once
 }
 
 func NewSMTPHandler(cfg codersdk.NotificationsEmailConfig, log slog.Logger) *SMTPHandler {
 	return &SMTPHandler{cfg: cfg, log: log}
 }
 
-func (s *SMTPHandler) Dispatcher(payload types.MessagePayload, titleTmpl, bodyTmpl string) (DeliveryFunc, error) {
+func (s *SMTPHandler) Dispatcher(payload types.MessagePayload, titleTmpl, bodyTmpl string, helpers template.FuncMap) (DeliveryFunc, error) {
 	// First render the subject & body into their own discrete strings.
 	subject, err := markdown.PlaintextFromMarkdown(titleTmpl)
 	if err != nil {
@@ -75,12 +76,12 @@ func (s *SMTPHandler) Dispatcher(payload types.MessagePayload, titleTmpl, bodyTm
 	// Then, reuse these strings in the HTML & plain body templates.
 	payload.Labels["_subject"] = subject
 	payload.Labels["_body"] = htmlBody
-	htmlBody, err = render.GoTemplate(htmlTemplate, payload, nil)
+	htmlBody, err = render.GoTemplate(htmlTemplate, payload, helpers)
 	if err != nil {
 		return nil, xerrors.Errorf("render full html template: %w", err)
 	}
 	payload.Labels["_body"] = plainBody
-	plainBody, err = render.GoTemplate(plainTemplate, payload, nil)
+	plainBody, err = render.GoTemplate(plainTemplate, payload, helpers)
 	if err != nil {
 		return nil, xerrors.Errorf("render full plaintext template: %w", err)
 	}
@@ -133,14 +134,20 @@ func (s *SMTPHandler) dispatch(subject, htmlBody, plainBody, to string) Delivery
 
 		// Check for authentication capabilities.
 		if ok, avail := c.Extension("AUTH"); ok {
-			// Ensure the auth mechanisms available are ones we can use.
+			// Ensure the auth mechanisms available are ones we can use, and create a SASL client.
 			auth, err := s.auth(ctx, avail)
 			if err != nil {
 				return true, xerrors.Errorf("determine auth mechanism: %w", err)
 			}
 
-			// If so, use the auth mechanism to authenticate.
-			if auth != nil {
+			if auth == nil {
+				// If we get here, no SASL client (which handles authentication) was returned.
+				// This is expected if auth is supported by the smarthost BUT no authentication details were configured.
+				s.noAuthWarnOnce.Do(func() {
+					s.log.Warn(ctx, "skipping auth; no authentication client created")
+				})
+			} else {
+				// We have a SASL client, use it to authenticate.
 				if err := c.Auth(auth); err != nil {
 					return true, xerrors.Errorf("%T auth: %w", auth, err)
 				}
@@ -180,7 +187,15 @@ func (s *SMTPHandler) dispatch(subject, htmlBody, plainBody, to string) Delivery
 		if err != nil {
 			return true, xerrors.Errorf("message transmission: %w", err)
 		}
-		defer message.Close()
+		closeOnce := sync.OnceValue(func() error {
+			return message.Close()
+		})
+		// Close the message when this method exits in order to not leak resources. Even though we're calling this explicitly
+		// further down, the method may exit before then.
+		defer func() {
+			// If we try close an already-closed writer, it'll send a subsequent request to the server which is invalid.
+			_ = closeOnce()
+		}()
 
 		// Create message headers.
 		msg := &bytes.Buffer{}
@@ -246,6 +261,10 @@ func (s *SMTPHandler) dispatch(subject, htmlBody, plainBody, to string) Delivery
 		_, err = message.Write(multipartBuffer.Bytes())
 		if err != nil {
 			return false, xerrors.Errorf("write body buffer: %w", err)
+		}
+
+		if err = closeOnce(); err != nil {
+			return true, xerrors.Errorf("delivery failure: %w", err)
 		}
 
 		// Returning false, nil indicates successful send (i.e. non-retryable non-error)
@@ -416,6 +435,12 @@ func (s *SMTPHandler) loadCertificate() (*tls.Certificate, error) {
 func (s *SMTPHandler) auth(ctx context.Context, mechs string) (sasl.Client, error) {
 	username := s.cfg.Auth.Username.String()
 
+	// All auth mechanisms require username, so if one is not defined then don't return an auth client.
+	if username == "" {
+		// nolint:nilnil // This is a valid response.
+		return nil, nil
+	}
+
 	var errs error
 	list := strings.Split(mechs, " ")
 	for _, mech := range list {
@@ -427,7 +452,7 @@ func (s *SMTPHandler) auth(ctx context.Context, mechs string) (sasl.Client, erro
 				continue
 			}
 			if password == "" {
-				errs = multierror.Append(errs, xerrors.New("cannot use PLAIN auth, password not defined (see CODER_NOTIFICATIONS_EMAIL_AUTH_PASSWORD)"))
+				errs = multierror.Append(errs, xerrors.New("cannot use PLAIN auth, password not defined (see CODER_EMAIL_AUTH_PASSWORD)"))
 				continue
 			}
 
@@ -449,7 +474,7 @@ func (s *SMTPHandler) auth(ctx context.Context, mechs string) (sasl.Client, erro
 				continue
 			}
 			if password == "" {
-				errs = multierror.Append(errs, xerrors.New("cannot use LOGIN auth, password not defined (see CODER_NOTIFICATIONS_EMAIL_AUTH_PASSWORD)"))
+				errs = multierror.Append(errs, xerrors.New("cannot use LOGIN auth, password not defined (see CODER_EMAIL_AUTH_PASSWORD)"))
 				continue
 			}
 
@@ -468,7 +493,7 @@ func (*SMTPHandler) validateFromAddr(from string) (string, error) {
 		return "", xerrors.Errorf("parse 'from' address: %w", err)
 	}
 	if len(addrs) != 1 {
-		return "", ValidationNoFromAddressErr
+		return "", ErrValidationNoFromAddress
 	}
 	return from, nil
 }
@@ -480,7 +505,7 @@ func (s *SMTPHandler) validateToAddrs(to string) ([]string, error) {
 	}
 	if len(addrs) == 0 {
 		s.log.Warn(context.Background(), "no valid 'to' address(es) defined; some may be invalid", slog.F("defined", to))
-		return nil, ValidationNoToAddressErr
+		return nil, ErrValidationNoToAddress
 	}
 
 	var out []string
@@ -495,15 +520,14 @@ func (s *SMTPHandler) validateToAddrs(to string) ([]string, error) {
 // Does not allow overriding.
 // nolint:revive // documented.
 func (s *SMTPHandler) smarthost() (string, string, error) {
-	host := s.cfg.Smarthost.Host
-	port := s.cfg.Smarthost.Port
-
-	// We don't validate the contents themselves; this will be done by the underlying SMTP library.
-	if host == "" {
-		return "", "", ValidationNoSmarthostHostErr
+	smarthost := strings.TrimSpace(string(s.cfg.Smarthost))
+	if smarthost == "" {
+		return "", "", ErrValidationNoSmarthost
 	}
-	if port == "" {
-		return "", "", ValidationNoSmarthostPortErr
+
+	host, port, err := net.SplitHostPort(string(s.cfg.Smarthost))
+	if err != nil {
+		return "", "", xerrors.Errorf("split host port: %w", err)
 	}
 
 	return host, port, nil
@@ -514,7 +538,7 @@ func (s *SMTPHandler) smarthost() (string, string, error) {
 func (s *SMTPHandler) hello() (string, error) {
 	val := s.cfg.Hello.String()
 	if val == "" {
-		return "", ValidationNoHelloErr
+		return "", ErrValidationNoHello
 	}
 	return val, nil
 }

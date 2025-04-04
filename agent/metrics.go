@@ -19,6 +19,7 @@ type agentMetrics struct {
 	// startupScriptSeconds is the time in seconds that the start script(s)
 	// took to run. This is reported once per agent.
 	startupScriptSeconds *prometheus.GaugeVec
+	currentConnections   *prometheus.GaugeVec
 }
 
 func newAgentMetrics(registerer prometheus.Registerer) *agentMetrics {
@@ -45,10 +46,19 @@ func newAgentMetrics(registerer prometheus.Registerer) *agentMetrics {
 	}, []string{"success"})
 	registerer.MustRegister(startupScriptSeconds)
 
+	currentConnections := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "coderd",
+		Subsystem: "agentstats",
+		Name:      "currently_reachable_peers",
+		Help:      "The number of peers (e.g. clients) that are currently reachable over the encrypted network.",
+	}, []string{"connection_type"})
+	registerer.MustRegister(currentConnections)
+
 	return &agentMetrics{
 		connectionsTotal:      connectionsTotal,
 		reconnectingPTYErrors: reconnectingPTYErrors,
 		startupScriptSeconds:  startupScriptSeconds,
+		currentConnections:    currentConnections,
 	}
 }
 
@@ -79,21 +89,22 @@ func (a *agent) collectMetrics(ctx context.Context) []*proto.Stats_Metric {
 		for _, metric := range metricFamily.GetMetric() {
 			labels := toAgentMetricLabels(metric.Label)
 
-			if metric.Counter != nil {
+			switch {
+			case metric.Counter != nil:
 				collected = append(collected, &proto.Stats_Metric{
 					Name:   metricFamily.GetName(),
 					Type:   proto.Stats_Metric_COUNTER,
 					Value:  metric.Counter.GetValue(),
 					Labels: labels,
 				})
-			} else if metric.Gauge != nil {
+			case metric.Gauge != nil:
 				collected = append(collected, &proto.Stats_Metric{
 					Name:   metricFamily.GetName(),
 					Type:   proto.Stats_Metric_GAUGE,
 					Value:  metric.Gauge.GetValue(),
 					Labels: labels,
 				})
-			} else {
+			default:
 				a.logger.Error(ctx, "unsupported metric type", slog.F("type", metricFamily.Type.String()))
 			}
 		}

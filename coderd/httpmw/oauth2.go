@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"reflect"
 
 	"github.com/go-chi/chi/v5"
@@ -85,6 +86,15 @@ func ExtractOAuth2(config promoauth.OAuth2Config, client *http.Client, authURLOp
 
 			code := r.URL.Query().Get("code")
 			state := r.URL.Query().Get("state")
+			redirect := r.URL.Query().Get("redirect")
+			if redirect != "" {
+				// We want to ensure that we're only ever redirecting to the application.
+				// We could be more strict here and check to see if the host matches
+				// the host of the AccessURL but ultimately as long as our redirect
+				// url omits a host we're ensuring that we're routing to a path
+				// local to the application.
+				redirect = uriFromURL(redirect)
+			}
 
 			if code == "" {
 				// If the code isn't provided, we'll redirect!
@@ -119,7 +129,7 @@ func ExtractOAuth2(config promoauth.OAuth2Config, client *http.Client, authURLOp
 				// an old redirect could apply!
 				http.SetCookie(rw, &http.Cookie{
 					Name:     codersdk.OAuth2RedirectCookie,
-					Value:    r.URL.Query().Get("redirect"),
+					Value:    redirect,
 					Path:     "/",
 					HttpOnly: true,
 					SameSite: http.SameSiteLaxMode,
@@ -150,7 +160,6 @@ func ExtractOAuth2(config promoauth.OAuth2Config, client *http.Client, authURLOp
 				return
 			}
 
-			var redirect string
 			stateRedirect, err := r.Cookie(codersdk.OAuth2RedirectCookie)
 			if err == nil {
 				redirect = stateRedirect.Value
@@ -158,9 +167,16 @@ func ExtractOAuth2(config promoauth.OAuth2Config, client *http.Client, authURLOp
 
 			oauthToken, err := config.Exchange(ctx, code)
 			if err != nil {
-				httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-					Message: "Internal error exchanging Oauth code.",
-					Detail:  err.Error(),
+				errorCode := http.StatusInternalServerError
+				detail := err.Error()
+				if detail == "authorization_pending" {
+					// In the device flow, the token may not be immediately
+					// available. This is expected, and the client will retry.
+					errorCode = http.StatusBadRequest
+				}
+				httpapi.Write(ctx, rw, errorCode, codersdk.Response{
+					Message: "Failed exchanging Oauth code.",
+					Detail:  detail,
 				})
 				return
 			}
@@ -301,4 +317,13 @@ func ExtractOAuth2ProviderAppSecret(db database.Store) func(http.Handler) http.H
 			next.ServeHTTP(rw, r.WithContext(ctx))
 		})
 	}
+}
+
+func uriFromURL(u string) string {
+	uri, err := url.Parse(u)
+	if err != nil {
+		return "/"
+	}
+
+	return uri.RequestURI()
 }

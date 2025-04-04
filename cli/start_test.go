@@ -79,25 +79,27 @@ var (
 func TestStart(t *testing.T) {
 	t.Parallel()
 
-	echoResponses := &echo.Responses{
-		Parse: echo.ParseComplete,
-		ProvisionPlan: []*proto.Response{
-			{
-				Type: &proto.Response_Plan{
-					Plan: &proto.PlanComplete{
-						Parameters: []*proto.RichParameter{
-							{
-								Name:        ephemeralParameterName,
-								Description: ephemeralParameterDescription,
-								Mutable:     true,
-								Ephemeral:   true,
+	echoResponses := func() *echo.Responses {
+		return &echo.Responses{
+			Parse: echo.ParseComplete,
+			ProvisionPlan: []*proto.Response{
+				{
+					Type: &proto.Response_Plan{
+						Plan: &proto.PlanComplete{
+							Parameters: []*proto.RichParameter{
+								{
+									Name:        ephemeralParameterName,
+									Description: ephemeralParameterDescription,
+									Mutable:     true,
+									Ephemeral:   true,
+								},
 							},
 						},
 					},
 				},
 			},
-		},
-		ProvisionApply: echo.ApplyComplete,
+			ProvisionApply: echo.ApplyComplete,
+		}
 	}
 
 	t.Run("BuildOptions", func(t *testing.T) {
@@ -106,7 +108,7 @@ func TestStart(t *testing.T) {
 		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
 		owner := coderdtest.CreateFirstUser(t, client)
 		member, _ := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID)
-		version := coderdtest.CreateTemplateVersion(t, client, owner.OrganizationID, echoResponses)
+		version := coderdtest.CreateTemplateVersion(t, client, owner.OrganizationID, echoResponses())
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version.ID)
 		workspace := coderdtest.CreateWorkspace(t, member, template.ID)
@@ -115,7 +117,7 @@ func TestStart(t *testing.T) {
 		workspaceBuild := coderdtest.CreateWorkspaceBuild(t, client, workspace, database.WorkspaceTransitionStop)
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspaceBuild.ID)
 
-		inv, root := clitest.New(t, "start", workspace.Name, "--build-options")
+		inv, root := clitest.New(t, "start", workspace.Name, "--prompt-ephemeral-parameters")
 		clitest.SetupConfig(t, member, root)
 		doneChan := make(chan struct{})
 		pty := ptytest.New(t).Attach(inv)
@@ -140,7 +142,7 @@ func TestStart(t *testing.T) {
 		}
 		<-doneChan
 
-		// Verify if build option is set
+		// Verify if ephemeral parameter is set
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
 		defer cancel()
 
@@ -154,13 +156,13 @@ func TestStart(t *testing.T) {
 		})
 	})
 
-	t.Run("BuildOptionFlags", func(t *testing.T) {
+	t.Run("EphemeralParameterFlags", func(t *testing.T) {
 		t.Parallel()
 
 		client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
 		owner := coderdtest.CreateFirstUser(t, client)
 		member, _ := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID)
-		version := coderdtest.CreateTemplateVersion(t, client, owner.OrganizationID, echoResponses)
+		version := coderdtest.CreateTemplateVersion(t, client, owner.OrganizationID, echoResponses())
 		coderdtest.AwaitTemplateVersionJobCompleted(t, client, version.ID)
 		template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version.ID)
 		workspace := coderdtest.CreateWorkspace(t, member, template.ID)
@@ -170,7 +172,7 @@ func TestStart(t *testing.T) {
 		coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspaceBuild.ID)
 
 		inv, root := clitest.New(t, "start", workspace.Name,
-			"--build-option", fmt.Sprintf("%s=%s", ephemeralParameterName, ephemeralParameterValue))
+			"--ephemeral-parameter", fmt.Sprintf("%s=%s", ephemeralParameterName, ephemeralParameterValue))
 		clitest.SetupConfig(t, member, root)
 		doneChan := make(chan struct{})
 		pty := ptytest.New(t).Attach(inv)
@@ -183,7 +185,7 @@ func TestStart(t *testing.T) {
 		pty.ExpectMatch("workspace has been started")
 		<-doneChan
 
-		// Verify if build option is set
+		// Verify if ephemeral parameter is set
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
 		defer cancel()
 
@@ -390,7 +392,7 @@ func TestStart_AlreadyRunning(t *testing.T) {
 	client, db := coderdtest.NewWithDatabase(t, nil)
 	owner := coderdtest.CreateFirstUser(t, client)
 	memberClient, member := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID)
-	r := dbfake.WorkspaceBuild(t, db, database.Workspace{
+	r := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
 		OwnerID:        member.ID,
 		OrganizationID: owner.OrganizationID,
 	}).Do()
@@ -417,7 +419,7 @@ func TestStart_Starting(t *testing.T) {
 	client := coderdtest.New(t, &coderdtest.Options{Pubsub: ps, Database: store})
 	owner := coderdtest.CreateFirstUser(t, client)
 	memberClient, member := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID)
-	r := dbfake.WorkspaceBuild(t, store, database.Workspace{
+	r := dbfake.WorkspaceBuild(t, store, database.WorkspaceTable{
 		OwnerID:        member.ID,
 		OrganizationID: owner.OrganizationID,
 	}).
@@ -439,5 +441,38 @@ func TestStart_Starting(t *testing.T) {
 	_ = dbfake.JobComplete(t, store, r.Build.JobID).Pubsub(ps).Do()
 	pty.ExpectMatch("workspace has been started")
 
+	_ = testutil.RequireRecvCtx(ctx, t, doneChan)
+}
+
+func TestStart_NoWait(t *testing.T) {
+	t.Parallel()
+	ctx := testutil.Context(t, testutil.WaitShort)
+
+	// Prepare user, template, workspace
+	client := coderdtest.New(t, &coderdtest.Options{IncludeProvisionerDaemon: true})
+	owner := coderdtest.CreateFirstUser(t, client)
+	member, _ := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID)
+	version1 := coderdtest.CreateTemplateVersion(t, client, owner.OrganizationID, nil)
+	coderdtest.AwaitTemplateVersionJobCompleted(t, client, version1.ID)
+	template := coderdtest.CreateTemplate(t, client, owner.OrganizationID, version1.ID)
+	workspace := coderdtest.CreateWorkspace(t, member, template.ID)
+	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, workspace.LatestBuild.ID)
+
+	// Stop the workspace
+	build := coderdtest.CreateWorkspaceBuild(t, member, workspace, database.WorkspaceTransitionStop)
+	coderdtest.AwaitWorkspaceBuildJobCompleted(t, client, build.ID)
+
+	// Start in no-wait mode
+	inv, root := clitest.New(t, "start", workspace.Name, "--no-wait")
+	clitest.SetupConfig(t, member, root)
+	doneChan := make(chan struct{})
+	pty := ptytest.New(t).Attach(inv)
+	go func() {
+		defer close(doneChan)
+		err := inv.Run()
+		assert.NoError(t, err)
+	}()
+
+	pty.ExpectMatch("workspace has been started in no-wait mode")
 	_ = testutil.RequireRecvCtx(ctx, t, doneChan)
 }

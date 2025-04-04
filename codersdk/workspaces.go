@@ -26,27 +26,28 @@ const (
 // Workspace is a deployment of a template. It references a specific
 // version and can be updated.
 type Workspace struct {
-	ID                                   uuid.UUID      `json:"id" format:"uuid"`
-	CreatedAt                            time.Time      `json:"created_at" format:"date-time"`
-	UpdatedAt                            time.Time      `json:"updated_at" format:"date-time"`
-	OwnerID                              uuid.UUID      `json:"owner_id" format:"uuid"`
-	OwnerName                            string         `json:"owner_name"`
-	OwnerAvatarURL                       string         `json:"owner_avatar_url"`
-	OrganizationID                       uuid.UUID      `json:"organization_id" format:"uuid"`
-	OrganizationName                     string         `json:"organization_name"`
-	TemplateID                           uuid.UUID      `json:"template_id" format:"uuid"`
-	TemplateName                         string         `json:"template_name"`
-	TemplateDisplayName                  string         `json:"template_display_name"`
-	TemplateIcon                         string         `json:"template_icon"`
-	TemplateAllowUserCancelWorkspaceJobs bool           `json:"template_allow_user_cancel_workspace_jobs"`
-	TemplateActiveVersionID              uuid.UUID      `json:"template_active_version_id" format:"uuid"`
-	TemplateRequireActiveVersion         bool           `json:"template_require_active_version"`
-	LatestBuild                          WorkspaceBuild `json:"latest_build"`
-	Outdated                             bool           `json:"outdated"`
-	Name                                 string         `json:"name"`
-	AutostartSchedule                    *string        `json:"autostart_schedule,omitempty"`
-	TTLMillis                            *int64         `json:"ttl_ms,omitempty"`
-	LastUsedAt                           time.Time      `json:"last_used_at" format:"date-time"`
+	ID                                   uuid.UUID           `json:"id" format:"uuid"`
+	CreatedAt                            time.Time           `json:"created_at" format:"date-time"`
+	UpdatedAt                            time.Time           `json:"updated_at" format:"date-time"`
+	OwnerID                              uuid.UUID           `json:"owner_id" format:"uuid"`
+	OwnerName                            string              `json:"owner_name"`
+	OwnerAvatarURL                       string              `json:"owner_avatar_url"`
+	OrganizationID                       uuid.UUID           `json:"organization_id" format:"uuid"`
+	OrganizationName                     string              `json:"organization_name"`
+	TemplateID                           uuid.UUID           `json:"template_id" format:"uuid"`
+	TemplateName                         string              `json:"template_name"`
+	TemplateDisplayName                  string              `json:"template_display_name"`
+	TemplateIcon                         string              `json:"template_icon"`
+	TemplateAllowUserCancelWorkspaceJobs bool                `json:"template_allow_user_cancel_workspace_jobs"`
+	TemplateActiveVersionID              uuid.UUID           `json:"template_active_version_id" format:"uuid"`
+	TemplateRequireActiveVersion         bool                `json:"template_require_active_version"`
+	LatestBuild                          WorkspaceBuild      `json:"latest_build"`
+	LatestAppStatus                      *WorkspaceAppStatus `json:"latest_app_status"`
+	Outdated                             bool                `json:"outdated"`
+	Name                                 string              `json:"name"`
+	AutostartSchedule                    *string             `json:"autostart_schedule,omitempty"`
+	TTLMillis                            *int64              `json:"ttl_ms,omitempty"`
+	LastUsedAt                           time.Time           `json:"last_used_at" format:"date-time"`
 
 	// DeletingAt indicates the time at which the workspace will be permanently deleted.
 	// A workspace is eligible for deletion if it is dormant (a non-nil dormant_at value)
@@ -63,6 +64,7 @@ type Workspace struct {
 	AutomaticUpdates AutomaticUpdates `json:"automatic_updates" enums:"always,never"`
 	AllowRenames     bool             `json:"allow_renames"`
 	Favorite         bool             `json:"favorite"`
+	NextStartAt      *time.Time       `json:"next_start_at" format:"date-time"`
 }
 
 func (w Workspace) FullName() string {
@@ -93,7 +95,7 @@ const (
 // CreateWorkspaceBuildRequest provides options to update the latest workspace build.
 type CreateWorkspaceBuildRequest struct {
 	TemplateVersionID uuid.UUID           `json:"template_version_id,omitempty" format:"uuid"`
-	Transition        WorkspaceTransition `json:"transition" validate:"oneof=create start stop delete,required"`
+	Transition        WorkspaceTransition `json:"transition" validate:"oneof=start stop delete,required"`
 	DryRun            bool                `json:"dry_run,omitempty"`
 	ProvisionerState  []byte              `json:"state,omitempty"`
 	// Orphan may be set for the Destroy transition.
@@ -259,7 +261,7 @@ type UpdateWorkspaceAutostartRequest struct {
 	// Schedule is expected to be of the form `CRON_TZ=<IANA Timezone> <min> <hour> * * <dow>`
 	// Example: `CRON_TZ=US/Central 30 9 * * 1-5` represents 0930 in the timezone US/Central
 	// on weekdays (Mon-Fri). `CRON_TZ` defaults to UTC if not present.
-	Schedule *string `json:"schedule"`
+	Schedule *string `json:"schedule,omitempty"`
 }
 
 // UpdateWorkspaceAutostart sets the autostart schedule for workspace by id.
@@ -572,8 +574,8 @@ type WorkspaceQuota struct {
 	Budget          int `json:"budget"`
 }
 
-func (c *Client) WorkspaceQuota(ctx context.Context, userID string) (WorkspaceQuota, error) {
-	res, err := c.Request(ctx, http.MethodGet, fmt.Sprintf("/api/v2/workspace-quota/%s", userID), nil)
+func (c *Client) WorkspaceQuota(ctx context.Context, organizationID string, userID string) (WorkspaceQuota, error) {
+	res, err := c.Request(ctx, http.MethodGet, fmt.Sprintf("/api/v2/organizations/%s/members/%s/workspace-quota", organizationID, userID), nil)
 	if err != nil {
 		return WorkspaceQuota{}, err
 	}
@@ -626,9 +628,16 @@ func (c *Client) UnfavoriteWorkspace(ctx context.Context, workspaceID uuid.UUID)
 	return nil
 }
 
-// WorkspaceNotifyChannel is the PostgreSQL NOTIFY
-// channel to listen for updates on. The payload is empty,
-// because the size of a workspace payload can be very large.
-func WorkspaceNotifyChannel(id uuid.UUID) string {
-	return fmt.Sprintf("workspace:%s", id)
+func (c *Client) WorkspaceTimings(ctx context.Context, id uuid.UUID) (WorkspaceBuildTimings, error) {
+	path := fmt.Sprintf("/api/v2/workspaces/%s/timings", id.String())
+	res, err := c.Request(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return WorkspaceBuildTimings{}, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return WorkspaceBuildTimings{}, ReadBodyAsError(res)
+	}
+	var timings WorkspaceBuildTimings
+	return timings, json.NewDecoder(res.Body).Decode(&timings)
 }

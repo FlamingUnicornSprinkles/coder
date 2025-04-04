@@ -32,7 +32,7 @@ import (
 
 // UpdateGoldenFiles indicates golden files should be updated.
 // To update the golden files:
-// make update-golden-files
+// make gen/golden-files
 var UpdateGoldenFiles = flag.Bool("update", false, "update .golden files")
 
 // TestHeartbeats_Cleanup tests the cleanup loop
@@ -44,7 +44,7 @@ func TestHeartbeats_Cleanup(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
 	defer cancel()
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 
 	mStore.EXPECT().CleanTailnetCoordinators(gomock.Any()).Times(2).Return(nil)
 	mStore.EXPECT().CleanTailnetLostPeers(gomock.Any()).Times(2).Return(nil)
@@ -77,7 +77,7 @@ func TestHeartbeats_recvBeat_resetSkew(t *testing.T) {
 	t.Parallel()
 
 	ctx := testutil.Context(t, testutil.WaitShort)
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 	mClock := quartz.NewMock(t)
 	trap := mClock.Trap().Until("heartbeats", "resetExpiryTimerWithLock")
 	defer trap.Close()
@@ -133,7 +133,7 @@ func TestHeartbeats_LostCoordinator_MarkLost(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitShort)
 	defer cancel()
-	logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+	logger := testutil.Logger(t)
 
 	uut := &heartbeats{
 		ctx:    ctx,
@@ -316,11 +316,11 @@ func TestDebugTemplate(t *testing.T) {
 	}
 
 	expected, err := os.ReadFile(goldenPath)
-	require.NoError(t, err, "read golden file, run \"make update-golden-files\" and commit the changes")
+	require.NoError(t, err, "read golden file, run \"make gen/golden-files\" and commit the changes")
 
 	require.Equal(
 		t, string(expected), string(actual),
-		"golden file mismatch: %s, run \"make update-golden-files\", verify and commit the changes",
+		"golden file mismatch: %s, run \"make gen/golden-files\", verify and commit the changes",
 		goldenPath,
 	)
 }
@@ -396,10 +396,6 @@ func TestPGCoordinatorUnhealthy(t *testing.T) {
 		UpsertTailnetCoordinator(gomock.Any(), gomock.Any()).
 		Times(3).
 		Return(database.TailnetCoordinator{}, xerrors.New("badness"))
-	mStore.EXPECT().
-		DeleteCoordinator(gomock.Any(), gomock.Any()).
-		Times(1).
-		Return(nil)
 	// But, in particular we DO NOT want the coordinator to call DeleteTailnetPeer, as this is
 	// unnecessary and can spam the database. c.f. https://github.com/coder/coder/issues/12923
 
@@ -407,6 +403,7 @@ func TestPGCoordinatorUnhealthy(t *testing.T) {
 	mStore.EXPECT().CleanTailnetCoordinators(gomock.Any()).AnyTimes().Return(nil)
 	mStore.EXPECT().CleanTailnetLostPeers(gomock.Any()).AnyTimes().Return(nil)
 	mStore.EXPECT().CleanTailnetTunnels(gomock.Any()).AnyTimes().Return(nil)
+	mStore.EXPECT().UpdateTailnetPeerStatusByCoordinator(gomock.Any(), gomock.Any())
 
 	coordinator, err := newPGCoordInternal(ctx, logger, ps, mStore, mClock)
 	require.NoError(t, err)

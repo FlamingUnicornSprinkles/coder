@@ -1,5 +1,3 @@
-//go:build linux
-
 package migrations_test
 
 import (
@@ -8,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 
@@ -19,7 +18,6 @@ import (
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
-	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
@@ -28,7 +26,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m, testutil.GoleakOptions...)
 }
 
 func TestMigrate(t *testing.T) {
@@ -95,9 +93,8 @@ func TestMigrate(t *testing.T) {
 func testSQLDB(t testing.TB) *sql.DB {
 	t.Helper()
 
-	connection, closeFn, err := dbtestutil.Open()
+	connection, err := dbtestutil.Open(t)
 	require.NoError(t, err)
-	t.Cleanup(closeFn)
 
 	db, err := sql.Open("postgres", connection)
 	require.NoError(t, err)
@@ -202,7 +199,7 @@ func (s *tableStats) Add(table string, n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.s[table] = s.s[table] + n
+	s.s[table] += n
 }
 
 func (s *tableStats) Empty() []string {
@@ -268,6 +265,7 @@ func TestMigrateUpWithFixtures(t *testing.T) {
 		"template_version_variables",
 		"dbcrypt_keys", // having zero rows is a valid state for this table
 		"template_version_workspace_tags",
+		"notification_report_generator_logs",
 	}
 	s := &tableStats{s: make(map[string]int)}
 
@@ -283,9 +281,9 @@ func TestMigrateUpWithFixtures(t *testing.T) {
 			}
 		}
 		if len(emptyTables) > 0 {
-			t.Logf("The following tables have zero rows, consider adding fixtures for them or create a full database dump:")
+			t.Log("The following tables have zero rows, consider adding fixtures for them or create a full database dump:")
 			t.Errorf("tables have zero rows: %v", emptyTables)
-			t.Logf("See https://github.com/coder/coder/blob/main/docs/CONTRIBUTING.md#database-fixtures-for-testing-migrations for more information")
+			t.Log("See https://github.com/coder/coder/blob/main/docs/CONTRIBUTING.md#database-fixtures-for-testing-migrations for more information")
 		}
 	})
 

@@ -14,7 +14,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/hashicorp/yamux"
 	"golang.org/x/xerrors"
-	"nhooyr.io/websocket"
 
 	"cdr.dev/slog"
 	"github.com/coder/coder/v2/agent/proto"
@@ -26,9 +25,11 @@ import (
 	"github.com/coder/coder/v2/coderd/httpmw"
 	"github.com/coder/coder/v2/coderd/telemetry"
 	"github.com/coder/coder/v2/coderd/util/ptr"
+	"github.com/coder/coder/v2/coderd/wspubsub"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/tailnet"
 	tailnetproto "github.com/coder/coder/v2/tailnet/proto"
+	"github.com/coder/websocket"
 )
 
 // @Summary Workspace agent RPC API
@@ -116,20 +117,37 @@ func (api *API) workspaceAgentRPC(rw http.ResponseWriter, r *http.Request) {
 	}
 	defer mux.Close()
 
-	logger.Debug(ctx, "accepting agent RPC connection", slog.F("agent", workspaceAgent))
+	logger.Debug(ctx, "accepting agent RPC connection",
+		slog.F("agent_id", workspaceAgent.ID),
+		slog.F("agent_created_at", workspaceAgent.CreatedAt),
+		slog.F("agent_updated_at", workspaceAgent.UpdatedAt),
+		slog.F("agent_name", workspaceAgent.Name),
+		slog.F("agent_first_connected_at", workspaceAgent.FirstConnectedAt.Time),
+		slog.F("agent_last_connected_at", workspaceAgent.LastConnectedAt.Time),
+		slog.F("agent_disconnected_at", workspaceAgent.DisconnectedAt.Time),
+		slog.F("agent_version", workspaceAgent.Version),
+		slog.F("agent_last_connected_replica_id", workspaceAgent.LastConnectedReplicaID),
+		slog.F("agent_connection_timeout_seconds", workspaceAgent.ConnectionTimeoutSeconds),
+		slog.F("agent_api_version", workspaceAgent.APIVersion),
+		slog.F("agent_resource_id", workspaceAgent.ResourceID))
 
 	closeCtx, closeCtxCancel := context.WithCancel(ctx)
 	defer closeCtxCancel()
-	monitor := api.startAgentYamuxMonitor(closeCtx, workspaceAgent, build, mux)
+	monitor := api.startAgentYamuxMonitor(closeCtx, workspace, workspaceAgent, build, mux)
 	defer monitor.close()
 
 	agentAPI := agentapi.New(agentapi.Options{
-		AgentID: workspaceAgent.ID,
+		AgentID:     workspaceAgent.ID,
+		OwnerID:     workspace.OwnerID,
+		WorkspaceID: workspace.ID,
 
 		Ctx:                               api.ctx,
 		Log:                               logger,
+		Clock:                             api.Clock,
 		Database:                          api.Database,
+		NotificationsEnqueuer:             api.NotificationsEnqueuer,
 		Pubsub:                            api.Pubsub,
+		Auditor:                           &api.Auditor,
 		DerpMapFn:                         api.DERPMap,
 		TailnetCoordinator:                &api.TailnetCoordinator,
 		AppearanceFetcher:                 &api.AppearanceFetcher,
@@ -148,7 +166,6 @@ func (api *API) workspaceAgentRPC(rw http.ResponseWriter, r *http.Request) {
 		Experiments:               api.Experiments,
 
 		// Optional:
-		WorkspaceID:          build.WorkspaceID, // saves the extra lookup later
 		UpdateAgentMetricsFn: api.UpdateAgentMetrics,
 	})
 
@@ -213,11 +230,14 @@ func (y *yamuxPingerCloser) Ping(ctx context.Context) error {
 }
 
 func (api *API) startAgentYamuxMonitor(ctx context.Context,
-	workspaceAgent database.WorkspaceAgent, workspaceBuild database.WorkspaceBuild,
+	workspace database.Workspace,
+	workspaceAgent database.WorkspaceAgent,
+	workspaceBuild database.WorkspaceBuild,
 	mux *yamux.Session,
 ) *agentConnectionMonitor {
 	monitor := &agentConnectionMonitor{
 		apiCtx:            api.ctx,
+		workspace:         workspace,
 		workspaceAgent:    workspaceAgent,
 		workspaceBuild:    workspaceBuild,
 		conn:              &yamuxPingerCloser{mux: mux},
@@ -238,7 +258,7 @@ func (api *API) startAgentYamuxMonitor(ctx context.Context,
 }
 
 type workspaceUpdater interface {
-	publishWorkspaceUpdate(ctx context.Context, workspaceID uuid.UUID)
+	publishWorkspaceUpdate(ctx context.Context, ownerID uuid.UUID, event wspubsub.WorkspaceEvent)
 }
 
 type pingerCloser interface {
@@ -250,6 +270,7 @@ type agentConnectionMonitor struct {
 	apiCtx         context.Context
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
+	workspace      database.Workspace
 	workspaceAgent database.WorkspaceAgent
 	workspaceBuild database.WorkspaceBuild
 	conn           pingerCloser
@@ -381,7 +402,11 @@ func (m *agentConnectionMonitor) monitor(ctx context.Context) {
 				)
 			}
 		}
-		m.updater.publishWorkspaceUpdate(finalCtx, m.workspaceBuild.WorkspaceID)
+		m.updater.publishWorkspaceUpdate(finalCtx, m.workspace.OwnerID, wspubsub.WorkspaceEvent{
+			Kind:        wspubsub.WorkspaceEventKindAgentConnectionUpdate,
+			WorkspaceID: m.workspaceBuild.WorkspaceID,
+			AgentID:     &m.workspaceAgent.ID,
+		})
 	}()
 	reason := "disconnect"
 	defer func() {
@@ -395,7 +420,11 @@ func (m *agentConnectionMonitor) monitor(ctx context.Context) {
 		reason = err.Error()
 		return
 	}
-	m.updater.publishWorkspaceUpdate(ctx, m.workspaceBuild.WorkspaceID)
+	m.updater.publishWorkspaceUpdate(ctx, m.workspace.OwnerID, wspubsub.WorkspaceEvent{
+		Kind:        wspubsub.WorkspaceEventKindAgentConnectionUpdate,
+		WorkspaceID: m.workspaceBuild.WorkspaceID,
+		AgentID:     &m.workspaceAgent.ID,
+	})
 
 	ticker := time.NewTicker(m.pingPeriod)
 	defer ticker.Stop()
@@ -429,7 +458,11 @@ func (m *agentConnectionMonitor) monitor(ctx context.Context) {
 			return
 		}
 		if connectionStatusChanged {
-			m.updater.publishWorkspaceUpdate(ctx, m.workspaceBuild.WorkspaceID)
+			m.updater.publishWorkspaceUpdate(ctx, m.workspace.OwnerID, wspubsub.WorkspaceEvent{
+				Kind:        wspubsub.WorkspaceEventKindAgentConnectionUpdate,
+				WorkspaceID: m.workspaceBuild.WorkspaceID,
+				AgentID:     &m.workspaceAgent.ID,
+			})
 		}
 		err = checkBuildIsLatest(ctx, m.db, m.workspaceBuild)
 		if err != nil {

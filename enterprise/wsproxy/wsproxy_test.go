@@ -25,6 +25,9 @@ import (
 	"github.com/coder/coder/v2/agent/agenttest"
 	"github.com/coder/coder/v2/buildinfo"
 	"github.com/coder/coder/v2/coderd/coderdtest"
+	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/dbgen"
+	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/healthcheck/derphealth"
 	"github.com/coder/coder/v2/coderd/httpmw"
 	"github.com/coder/coder/v2/coderd/workspaceapps/apptest"
@@ -45,7 +48,6 @@ func TestDERPOnly(t *testing.T) {
 	deploymentValues := coderdtest.DeploymentValues(t)
 	deploymentValues.Experiments = []string{
 		"*",
-		string(codersdk.ExperimentMultiOrganization),
 	}
 
 	client, closer, api, _ := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
@@ -94,7 +96,6 @@ func TestDERP(t *testing.T) {
 	deploymentValues := coderdtest.DeploymentValues(t)
 	deploymentValues.Experiments = []string{
 		"*",
-		string(codersdk.ExperimentMultiOrganization),
 	}
 
 	client, closer, api, user := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
@@ -312,7 +313,7 @@ resourceLoop:
 		t.Parallel()
 
 		// Try to connect to the DERP server on the no-derp-proxy region.
-		client, err := derphttp.NewClient(key.NewNode(), proxyAPI3.Options.AccessURL.String(), func(format string, args ...any) {})
+		client, err := derphttp.NewClient(key.NewNode(), proxyAPI3.Options.AccessURL.String(), func(string, ...any) {})
 		require.NoError(t, err)
 
 		ctx := testutil.Context(t, testutil.WaitLong)
@@ -327,7 +328,6 @@ func TestDERPEndToEnd(t *testing.T) {
 	deploymentValues := coderdtest.DeploymentValues(t)
 	deploymentValues.Experiments = []string{
 		"*",
-		string(codersdk.ExperimentMultiOrganization),
 	}
 	deploymentValues.DERP.Config.BlockDirect = true
 
@@ -405,7 +405,7 @@ func TestDERPEndToEnd(t *testing.T) {
 		proxyOnlyDERPMap.OmitDefaultRegions = true
 		return true
 	}, testutil.WaitLong, testutil.IntervalMedium)
-	newDERPMapper := func(derpMap *tailcfg.DERPMap) *tailcfg.DERPMap {
+	newDERPMapper := func(_ *tailcfg.DERPMap) *tailcfg.DERPMap {
 		return proxyOnlyDERPMap
 	}
 	api.AGPL.DERPMapper.Store(&newDERPMapper)
@@ -467,7 +467,6 @@ func TestDERPMesh(t *testing.T) {
 	deploymentValues := coderdtest.DeploymentValues(t)
 	deploymentValues.Experiments = []string{
 		"*",
-		string(codersdk.ExperimentMultiOrganization),
 	}
 
 	client, closer, api, _ := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
@@ -577,7 +576,7 @@ func TestWorkspaceProxyDERPMeshProbe(t *testing.T) {
 	registerBrokenProxy := func(ctx context.Context, t *testing.T, primaryAccessURL *url.URL, accessURL, token string) uuid.UUID {
 		t.Helper()
 		// Create a HTTP server that always replies with 500.
-		srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 			rw.WriteHeader(http.StatusInternalServerError)
 		}))
 		t.Cleanup(srv.Close)
@@ -610,7 +609,6 @@ func TestWorkspaceProxyDERPMeshProbe(t *testing.T) {
 		deploymentValues := coderdtest.DeploymentValues(t)
 		deploymentValues.Experiments = []string{
 			"*",
-			string(codersdk.ExperimentMultiOrganization),
 		}
 
 		client, closer, api, _ := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
@@ -722,7 +720,6 @@ func TestWorkspaceProxyDERPMeshProbe(t *testing.T) {
 		deploymentValues := coderdtest.DeploymentValues(t)
 		deploymentValues.Experiments = []string{
 			"*",
-			string(codersdk.ExperimentMultiOrganization),
 		}
 
 		client, closer, api, _ := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
@@ -811,7 +808,6 @@ func TestWorkspaceProxyDERPMeshProbe(t *testing.T) {
 		deploymentValues := coderdtest.DeploymentValues(t)
 		deploymentValues.Experiments = []string{
 			"*",
-			string(codersdk.ExperimentMultiOrganization),
 		}
 
 		client, closer, api, _ := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
@@ -848,7 +844,7 @@ func TestWorkspaceProxyDERPMeshProbe(t *testing.T) {
 		proxy := coderdenttest.NewWorkspaceProxyReplica(t, api, client, &coderdenttest.ProxyOptions{
 			Name:     "proxy-2",
 			ProxyURL: proxyURL,
-			ReplicaPingCallback: func(replicas []codersdk.Replica, err string) {
+			ReplicaPingCallback: func(_ []codersdk.Replica, err string) {
 				replicaPingErr <- err
 			},
 		})
@@ -927,7 +923,6 @@ func TestWorkspaceProxyWorkspaceApps(t *testing.T) {
 		deploymentValues.Dangerous.AllowPathAppSiteOwnerAccess = serpent.Bool(opts.DangerousAllowPathAppSiteOwnerAccess)
 		deploymentValues.Experiments = []string{
 			"*",
-			string(codersdk.ExperimentMultiOrganization),
 		}
 
 		proxyStatsCollectorFlushCh := make(chan chan<- struct{}, 1)
@@ -940,6 +935,9 @@ func TestWorkspaceProxyWorkspaceApps(t *testing.T) {
 		if opts.PrimaryAppHost == "" {
 			opts.PrimaryAppHost = "*.primary.test.coder.com"
 		}
+
+		db, pubsub := dbtestutil.NewDB(t)
+
 		client, closer, api, user := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues:         deploymentValues,
@@ -955,6 +953,8 @@ func TestWorkspaceProxyWorkspaceApps(t *testing.T) {
 					},
 				},
 				WorkspaceAppsStatsCollectorOptions: opts.StatsCollectorOptions,
+				Database:                           db,
+				Pubsub:                             pubsub,
 			},
 			LicenseOptions: &coderdenttest.LicenseOptions{
 				Features: license.Features{
@@ -965,6 +965,13 @@ func TestWorkspaceProxyWorkspaceApps(t *testing.T) {
 		})
 		t.Cleanup(func() {
 			_ = closer.Close()
+		})
+
+		_ = dbgen.CryptoKey(t, db, database.CryptoKey{
+			Feature: database.CryptoKeyFeatureWorkspaceAppsToken,
+		})
+		_ = dbgen.CryptoKey(t, db, database.CryptoKey{
+			Feature: database.CryptoKeyFeatureWorkspaceAppsAPIKey,
 		})
 
 		// Create the external proxy
@@ -998,7 +1005,6 @@ func TestWorkspaceProxyWorkspaceApps_BlockDirect(t *testing.T) {
 		deploymentValues.Dangerous.AllowPathAppSiteOwnerAccess = serpent.Bool(opts.DangerousAllowPathAppSiteOwnerAccess)
 		deploymentValues.Experiments = []string{
 			"*",
-			string(codersdk.ExperimentMultiOrganization),
 		}
 
 		proxyStatsCollectorFlushCh := make(chan chan<- struct{}, 1)
@@ -1011,6 +1017,8 @@ func TestWorkspaceProxyWorkspaceApps_BlockDirect(t *testing.T) {
 		if opts.PrimaryAppHost == "" {
 			opts.PrimaryAppHost = "*.primary.test.coder.com"
 		}
+
+		db, pubsub := dbtestutil.NewDB(t)
 		client, closer, api, user := coderdenttest.NewWithAPI(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues:         deploymentValues,
@@ -1026,6 +1034,8 @@ func TestWorkspaceProxyWorkspaceApps_BlockDirect(t *testing.T) {
 					},
 				},
 				WorkspaceAppsStatsCollectorOptions: opts.StatsCollectorOptions,
+				Database:                           db,
+				Pubsub:                             pubsub,
 			},
 			LicenseOptions: &coderdenttest.LicenseOptions{
 				Features: license.Features{
@@ -1036,6 +1046,13 @@ func TestWorkspaceProxyWorkspaceApps_BlockDirect(t *testing.T) {
 		})
 		t.Cleanup(func() {
 			_ = closer.Close()
+		})
+
+		_ = dbgen.CryptoKey(t, db, database.CryptoKey{
+			Feature: database.CryptoKeyFeatureWorkspaceAppsToken,
+		})
+		_ = dbgen.CryptoKey(t, db, database.CryptoKey{
+			Feature: database.CryptoKeyFeatureWorkspaceAppsAPIKey,
 		})
 
 		// Create the external proxy

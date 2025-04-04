@@ -3,21 +3,23 @@ package coderd_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"cdr.dev/slog"
 	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/apiversion"
 	"github.com/coder/coder/v2/buildinfo"
 	"github.com/coder/coder/v2/coderd/coderdtest"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/db2sdk"
 	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/provisionerkey"
 	"github.com/coder/coder/v2/coderd/rbac"
@@ -48,7 +50,6 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		defer cancel()
 		daemonName := testutil.MustRandString(t, 63)
 		srv, err := templateAdminClient.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
-			ID:           uuid.New(),
 			Name:         daemonName,
 			Organization: user.OrganizationID,
 			Provisioners: []codersdk.ProvisionerType{
@@ -178,7 +179,6 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		defer cancel()
 		daemonName := testutil.MustRandString(t, 63)
 		_, err := templateAdminClient.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
-			ID:           uuid.New(),
 			Name:         daemonName,
 			Organization: user.OrganizationID,
 			Provisioners: []codersdk.ProvisionerType{
@@ -203,7 +203,6 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
 		_, err := another.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
-			ID:           uuid.New(),
 			Name:         testutil.MustRandString(t, 63),
 			Organization: user.OrganizationID,
 			Provisioners: []codersdk.ProvisionerType{
@@ -227,7 +226,6 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
 		_, err := another.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
-			ID:           uuid.New(),
 			Name:         testutil.MustRandString(t, 63),
 			Organization: user.OrganizationID,
 			Provisioners: []codersdk.ProvisionerType{
@@ -283,7 +281,7 @@ func TestProvisionerDaemonServe(t *testing.T) {
 			daemons, err := client.ProvisionerDaemons(context.Background())
 			assert.NoError(t, err, "failed to get provisioner daemons")
 			return len(daemons) > 0 &&
-				assert.Equal(t, t.Name(), daemons[0].Name) &&
+				assert.NotEmpty(t, daemons[0].Name) &&
 				assert.Equal(t, provisionersdk.ScopeUser, daemons[0].Tags[provisionersdk.TagScope]) &&
 				assert.Equal(t, user.UserID.String(), daemons[0].Tags[provisionersdk.TagOwner])
 		}, testutil.WaitShort, testutil.IntervalMedium)
@@ -347,6 +345,40 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		}
 	})
 
+	t.Run("ChangeTags", func(t *testing.T) {
+		t.Parallel()
+		client, user := coderdenttest.New(t, &coderdenttest.Options{LicenseOptions: &coderdenttest.LicenseOptions{
+			Features: license.Features{
+				codersdk.FeatureExternalProvisionerDaemons: 1,
+			},
+		}})
+		another, _ := coderdtest.CreateAnotherUser(t, client, user.OrganizationID, rbac.ScopedRoleOrgAdmin(user.OrganizationID))
+		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
+		defer cancel()
+		req := codersdk.ServeProvisionerDaemonRequest{
+			Name:         testutil.MustRandString(t, 63),
+			Organization: user.OrganizationID,
+			Provisioners: []codersdk.ProvisionerType{
+				codersdk.ProvisionerTypeEcho,
+			},
+			Tags: map[string]string{
+				provisionersdk.TagScope: provisionersdk.ScopeOrganization,
+			},
+		}
+		_, err := another.ServeProvisionerDaemon(ctx, req)
+		require.NoError(t, err)
+
+		// add tag
+		req.Tags["new"] = "tag"
+		_, err = another.ServeProvisionerDaemon(ctx, req)
+		require.NoError(t, err)
+
+		// remove tag
+		delete(req.Tags, "new")
+		_, err = another.ServeProvisionerDaemon(ctx, req)
+		require.NoError(t, err)
+	})
+
 	t.Run("PSK_daily_cost", func(t *testing.T) {
 		t.Parallel()
 		const provPSK = `provisionersftw`
@@ -360,7 +392,7 @@ func TestProvisionerDaemonServe(t *testing.T) {
 			},
 			ProvisionerDaemonPSK: provPSK,
 		})
-		logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
+		logger := testutil.Logger(t)
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
 
@@ -388,7 +420,6 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		another := codersdk.New(client.URL)
 		pd := provisionerd.New(func(ctx context.Context) (proto.DRPCProvisionerDaemonClient, error) {
 			return another.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
-				ID:           uuid.New(),
 				Name:         testutil.MustRandString(t, 63),
 				Organization: user.OrganizationID,
 				Provisioners: []codersdk.ProvisionerType{
@@ -466,7 +497,6 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
 		_, err := another.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
-			ID:           uuid.New(),
 			Name:         testutil.MustRandString(t, 32),
 			Organization: user.OrganizationID,
 			Provisioners: []codersdk.ProvisionerType{
@@ -501,7 +531,6 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		defer cancel()
 		another := codersdk.New(client.URL)
 		_, err := another.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
-			ID:           uuid.New(),
 			Name:         testutil.MustRandString(t, 63),
 			Organization: user.OrganizationID,
 			Provisioners: []codersdk.ProvisionerType{
@@ -534,7 +563,6 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		defer cancel()
 		another := codersdk.New(client.URL)
 		_, err := another.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
-			ID:           uuid.New(),
 			Name:         testutil.MustRandString(t, 63),
 			Organization: user.OrganizationID,
 			Provisioners: []codersdk.ProvisionerType{
@@ -562,17 +590,16 @@ func TestProvisionerDaemonServe(t *testing.T) {
 		require.NoError(t, err)
 
 		tcs := []struct {
-			name                      string
-			psk                       string
-			multiOrgFeatureEnabled    bool
-			multiOrgExperimentEnabled bool
-			insertParams              database.InsertProvisionerKeyParams
-			requestProvisionerKey     string
-			requestPSK                string
-			errStatusCode             int
+			name                   string
+			psk                    string
+			multiOrgFeatureEnabled bool
+			insertParams           database.InsertProvisionerKeyParams
+			requestProvisionerKey  string
+			requestPSK             string
+			errStatusCode          int
 		}{
 			{
-				name:       "MultiOrgDisabledPSKAuthOK",
+				name:       "PSKAuthOK",
 				psk:        "provisionersftw",
 				requestPSK: "provisionersftw",
 			},
@@ -583,58 +610,51 @@ func TestProvisionerDaemonServe(t *testing.T) {
 				requestPSK:             "provisionersftw",
 			},
 			{
-				name:                      "MultiOrgFeatureDisabledPSKAuthOK",
-				multiOrgExperimentEnabled: true,
-				psk:                       "provisionersftw",
-				requestPSK:                "provisionersftw",
+				name:       "MultiOrgFeatureDisabledPSKAuthOK",
+				psk:        "provisionersftw",
+				requestPSK: "provisionersftw",
 			},
 			{
-				name:                      "MultiOrgEnabledPSKAuthOK",
-				psk:                       "provisionersftw",
-				multiOrgFeatureEnabled:    true,
-				multiOrgExperimentEnabled: true,
-				requestPSK:                "provisionersftw",
+				name:                   "MultiOrgEnabledPSKAuthOK",
+				psk:                    "provisionersftw",
+				multiOrgFeatureEnabled: true,
+				requestPSK:             "provisionersftw",
 			},
 			{
-				name:                      "MultiOrgEnabledKeyAuthOK",
-				psk:                       "provisionersftw",
-				multiOrgFeatureEnabled:    true,
-				multiOrgExperimentEnabled: true,
-				insertParams:              insertParams,
-				requestProvisionerKey:     token,
+				name:                   "MultiOrgEnabledKeyAuthOK",
+				psk:                    "provisionersftw",
+				multiOrgFeatureEnabled: true,
+				insertParams:           insertParams,
+				requestProvisionerKey:  token,
 			},
 			{
-				name:                      "MultiOrgEnabledPSKAuthDisabled",
-				multiOrgFeatureEnabled:    true,
-				multiOrgExperimentEnabled: true,
-				requestPSK:                "provisionersftw",
-				errStatusCode:             http.StatusUnauthorized,
+				name:                   "MultiOrgEnabledPSKAuthDisabled",
+				multiOrgFeatureEnabled: true,
+				requestPSK:             "provisionersftw",
+				errStatusCode:          http.StatusUnauthorized,
 			},
 			{
-				name:                      "InvalidKey",
-				multiOrgFeatureEnabled:    true,
-				multiOrgExperimentEnabled: true,
-				insertParams:              insertParams,
-				requestProvisionerKey:     "provisionersftw",
-				errStatusCode:             http.StatusBadRequest,
+				name:                   "InvalidKey",
+				multiOrgFeatureEnabled: true,
+				insertParams:           insertParams,
+				requestProvisionerKey:  "provisionersftw",
+				errStatusCode:          http.StatusBadRequest,
 			},
 			{
-				name:                      "KeyAndPSK",
-				multiOrgFeatureEnabled:    true,
-				multiOrgExperimentEnabled: true,
-				psk:                       "provisionersftw",
-				insertParams:              insertParams,
-				requestProvisionerKey:     token,
-				requestPSK:                "provisionersftw",
-				errStatusCode:             http.StatusUnauthorized,
+				name:                   "KeyAndPSK",
+				multiOrgFeatureEnabled: true,
+				psk:                    "provisionersftw",
+				insertParams:           insertParams,
+				requestProvisionerKey:  token,
+				requestPSK:             "provisionersftw",
+				errStatusCode:          http.StatusUnauthorized,
 			},
 			{
-				name:                      "None",
-				multiOrgFeatureEnabled:    true,
-				multiOrgExperimentEnabled: true,
-				psk:                       "provisionersftw",
-				insertParams:              insertParams,
-				errStatusCode:             http.StatusUnauthorized,
+				name:                   "None",
+				multiOrgFeatureEnabled: true,
+				psk:                    "provisionersftw",
+				insertParams:           insertParams,
+				errStatusCode:          http.StatusUnauthorized,
 			},
 		}
 
@@ -648,9 +668,6 @@ func TestProvisionerDaemonServe(t *testing.T) {
 					features[codersdk.FeatureMultipleOrganizations] = 1
 				}
 				dv := coderdtest.DeploymentValues(t)
-				if tc.multiOrgExperimentEnabled {
-					dv.Experiments.Append(string(codersdk.ExperimentMultiOrganization))
-				}
 				client, db, user := coderdenttest.NewWithDatabase(t, &coderdenttest.Options{
 					LicenseOptions: &coderdenttest.LicenseOptions{
 						Features: features,
@@ -672,7 +689,6 @@ func TestProvisionerDaemonServe(t *testing.T) {
 
 				another := codersdk.New(client.URL)
 				srv, err := another.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
-					ID:           uuid.New(),
 					Name:         testutil.MustRandString(t, 63),
 					Organization: user.OrganizationID,
 					Provisioners: []codersdk.ProvisionerType{
@@ -703,11 +719,11 @@ func TestGetProvisionerDaemons(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
 		t.Parallel()
 		dv := coderdtest.DeploymentValues(t)
-		dv.Experiments = []string{string(codersdk.ExperimentMultiOrganization)}
-		client, _ := coderdenttest.New(t, &coderdenttest.Options{
+		client, first := coderdenttest.New(t, &coderdenttest.Options{
 			Options: &coderdtest.Options{
 				DeploymentValues: dv,
 			},
+			ProvisionerDaemonPSK: "provisionersftw",
 			LicenseOptions: &coderdenttest.LicenseOptions{
 				Features: license.Features{
 					codersdk.FeatureExternalProvisionerDaemons: 1,
@@ -717,27 +733,265 @@ func TestGetProvisionerDaemons(t *testing.T) {
 		})
 		org := coderdenttest.CreateOrganization(t, client, coderdenttest.CreateOrganizationOptions{})
 		orgAdmin, _ := coderdtest.CreateAnotherUser(t, client, org.ID, rbac.ScopedRoleOrgAdmin(org.ID))
+		outsideOrg, _ := coderdtest.CreateAnotherUser(t, client, first.OrganizationID)
+
+		res, err := orgAdmin.CreateProvisionerKey(context.Background(), org.ID, codersdk.CreateProvisionerKeyRequest{
+			Name: "my-key",
+		})
+		require.NoError(t, err)
+
+		keys, err := orgAdmin.ListProvisionerKeys(context.Background(), org.ID)
+		require.NoError(t, err)
+		require.Len(t, keys, 1)
+
 		ctx, cancel := context.WithTimeout(context.Background(), testutil.WaitLong)
 		defer cancel()
 		daemonName := testutil.MustRandString(t, 63)
 		srv, err := orgAdmin.ServeProvisionerDaemon(ctx, codersdk.ServeProvisionerDaemonRequest{
-			ID:           uuid.New(),
 			Name:         daemonName,
 			Organization: org.ID,
 			Provisioners: []codersdk.ProvisionerType{
 				codersdk.ProvisionerTypeEcho,
 			},
-			Tags: map[string]string{},
+			Tags:           map[string]string{},
+			ProvisionerKey: res.Key,
 		})
 		require.NoError(t, err)
 		srv.DRPCConn().Close()
 
-		daemons, err := orgAdmin.OrganizationProvisionerDaemons(ctx, org.ID)
+		daemons, err := orgAdmin.OrganizationProvisionerDaemons(ctx, org.ID, nil)
 		require.NoError(t, err)
-		if assert.Len(t, daemons, 1) {
-			assert.Equal(t, daemonName, daemons[0].Name)
-			assert.Equal(t, buildinfo.Version(), daemons[0].Version)
-			assert.Equal(t, proto.CurrentVersion.String(), daemons[0].APIVersion)
+		require.Len(t, daemons, 1)
+
+		assert.Equal(t, daemonName, daemons[0].Name)
+		assert.Equal(t, buildinfo.Version(), daemons[0].Version)
+		assert.Equal(t, proto.CurrentVersion.String(), daemons[0].APIVersion)
+		assert.Equal(t, keys[0].ID, daemons[0].KeyID)
+
+		pkDaemons, err := orgAdmin.ListProvisionerKeyDaemons(ctx, org.ID)
+		require.NoError(t, err)
+
+		require.Len(t, pkDaemons, 2)
+		require.Len(t, pkDaemons[0].Daemons, 1)
+		assert.Equal(t, keys[0].ID, pkDaemons[0].Key.ID)
+		assert.Equal(t, keys[0].Name, pkDaemons[0].Key.Name)
+		// user-auth provisioners
+		require.Len(t, pkDaemons[1].Daemons, 0)
+		assert.Equal(t, codersdk.ProvisionerKeyUUIDUserAuth, pkDaemons[1].Key.ID)
+		assert.Equal(t, codersdk.ProvisionerKeyNameUserAuth, pkDaemons[1].Key.Name)
+
+		assert.Equal(t, daemonName, pkDaemons[0].Daemons[0].Name)
+		assert.Equal(t, buildinfo.Version(), pkDaemons[0].Daemons[0].Version)
+		assert.Equal(t, proto.CurrentVersion.String(), pkDaemons[0].Daemons[0].APIVersion)
+		assert.Equal(t, keys[0].ID, pkDaemons[0].Daemons[0].KeyID)
+
+		// Verify user outside the org cannot read the provisioners
+		_, err = outsideOrg.ListProvisionerKeyDaemons(ctx, org.ID)
+		require.Error(t, err)
+	})
+
+	t.Run("filtered by tags", func(t *testing.T) {
+		t.Parallel()
+
+		testCases := []struct {
+			name                  string
+			tagsToFilterBy        map[string]string
+			provisionerDaemonTags map[string]string
+			expectToGetDaemon     bool
+		}{
+			{
+				name:                  "only an empty tagset finds an untagged provisioner",
+				tagsToFilterBy:        map[string]string{"scope": "organization", "owner": ""},
+				provisionerDaemonTags: map[string]string{"scope": "organization", "owner": ""},
+				expectToGetDaemon:     true,
+			},
+			{
+				name:                  "an exact match with a single optional tag finds a provisioner daemon",
+				tagsToFilterBy:        map[string]string{"scope": "organization", "owner": "", "environment": "on-prem"},
+				provisionerDaemonTags: map[string]string{"scope": "organization", "owner": "", "environment": "on-prem"},
+				expectToGetDaemon:     true,
+			},
+			{
+				name:                  "a subset of filter tags finds a daemon with a superset of tags",
+				tagsToFilterBy:        map[string]string{"scope": "organization", "owner": "", "environment": "on-prem"},
+				provisionerDaemonTags: map[string]string{"scope": "organization", "owner": "", "environment": "on-prem", "datacenter": "chicago"},
+				expectToGetDaemon:     true,
+			},
+			{
+				name:                  "an exact match with two additional tags finds a provisioner daemon",
+				tagsToFilterBy:        map[string]string{"scope": "organization", "owner": "", "environment": "on-prem", "datacenter": "chicago"},
+				provisionerDaemonTags: map[string]string{"scope": "organization", "owner": "", "environment": "on-prem", "datacenter": "chicago"},
+				expectToGetDaemon:     true,
+			},
+			{
+				name:                  "a user scoped filter tag set finds a user scoped provisioner daemon",
+				tagsToFilterBy:        map[string]string{"scope": "user", "owner": "aaa"},
+				provisionerDaemonTags: map[string]string{"scope": "user", "owner": "aaa"},
+				expectToGetDaemon:     true,
+			},
+			{
+				name:                  "a user scoped filter tag set finds a user scoped provisioner daemon with an additional tag",
+				tagsToFilterBy:        map[string]string{"scope": "user", "owner": "aaa"},
+				provisionerDaemonTags: map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem"},
+				expectToGetDaemon:     true,
+			},
+			{
+				name:                  "user-scoped provisioner with tags and user-scoped filter with tags",
+				tagsToFilterBy:        map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem"},
+				provisionerDaemonTags: map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem"},
+				expectToGetDaemon:     true,
+			},
+			{
+				name:                  "user-scoped provisioner with multiple tags and user-scoped filter with a subset of tags",
+				tagsToFilterBy:        map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem"},
+				provisionerDaemonTags: map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem", "datacenter": "chicago"},
+				expectToGetDaemon:     true,
+			},
+			{
+				name:                  "user-scoped provisioner with multiple tags and user-scoped filter with multiple tags",
+				tagsToFilterBy:        map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem", "datacenter": "chicago"},
+				provisionerDaemonTags: map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem", "datacenter": "chicago"},
+				expectToGetDaemon:     true,
+			},
+			{
+				name:                  "untagged provisioner and tagged filter",
+				tagsToFilterBy:        map[string]string{"scope": "organization", "owner": "", "environment": "on-prem"},
+				provisionerDaemonTags: map[string]string{"scope": "organization", "owner": ""},
+				expectToGetDaemon:     false,
+			},
+			{
+				name:                  "tagged provisioner and untagged filter",
+				tagsToFilterBy:        map[string]string{"scope": "organization", "owner": ""},
+				provisionerDaemonTags: map[string]string{"scope": "organization", "owner": "", "environment": "on-prem"},
+				expectToGetDaemon:     false,
+			},
+			{
+				name:                  "tagged provisioner and double-tagged filter",
+				tagsToFilterBy:        map[string]string{"scope": "organization", "owner": "", "environment": "on-prem", "datacenter": "chicago"},
+				provisionerDaemonTags: map[string]string{"scope": "organization", "owner": "", "environment": "on-prem"},
+				expectToGetDaemon:     false,
+			},
+			{
+				name:                  "double-tagged provisioner and double-tagged filter with differing tags",
+				tagsToFilterBy:        map[string]string{"scope": "organization", "owner": "", "environment": "on-prem", "datacenter": "chicago"},
+				provisionerDaemonTags: map[string]string{"scope": "organization", "owner": "", "environment": "on-prem", "datacenter": "new_york"},
+				expectToGetDaemon:     false,
+			},
+			{
+				name:                  "user-scoped provisioner and untagged filter",
+				tagsToFilterBy:        map[string]string{"scope": "organization", "owner": ""},
+				provisionerDaemonTags: map[string]string{"scope": "user", "owner": "aaa"},
+				expectToGetDaemon:     false,
+			},
+			{
+				name:                  "user-scoped provisioner and different user-scoped filter",
+				tagsToFilterBy:        map[string]string{"scope": "user", "owner": "bbb"},
+				provisionerDaemonTags: map[string]string{"scope": "user", "owner": "aaa"},
+				expectToGetDaemon:     false,
+			},
+			{
+				name:                  "org-scoped provisioner and user-scoped filter",
+				tagsToFilterBy:        map[string]string{"scope": "user", "owner": "aaa"},
+				provisionerDaemonTags: map[string]string{"scope": "organization", "owner": ""},
+				expectToGetDaemon:     false,
+			},
+			{
+				name:                  "user-scoped provisioner and org-scoped filter with tags",
+				tagsToFilterBy:        map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem"},
+				provisionerDaemonTags: map[string]string{"scope": "organization", "owner": ""},
+				expectToGetDaemon:     false,
+			},
+			{
+				name:                  "user-scoped provisioner and user-scoped filter with tags",
+				tagsToFilterBy:        map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem"},
+				provisionerDaemonTags: map[string]string{"scope": "user", "owner": "aaa"},
+				expectToGetDaemon:     false,
+			},
+			{
+				name:                  "user-scoped provisioner with tags and user-scoped filter with multiple tags",
+				tagsToFilterBy:        map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem", "datacenter": "chicago"},
+				provisionerDaemonTags: map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem"},
+				expectToGetDaemon:     false,
+			},
+			{
+				name:                  "user-scoped provisioner with tags and user-scoped filter with differing tags",
+				tagsToFilterBy:        map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem", "datacenter": "new_york"},
+				provisionerDaemonTags: map[string]string{"scope": "user", "owner": "aaa", "environment": "on-prem", "datacenter": "chicago"},
+				expectToGetDaemon:     false,
+			},
+		}
+		for _, tt := range testCases {
+			tt := tt
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				dv := coderdtest.DeploymentValues(t)
+				client, db, _ := coderdenttest.NewWithDatabase(t, &coderdenttest.Options{
+					Options: &coderdtest.Options{
+						DeploymentValues: dv,
+					},
+					ProvisionerDaemonPSK: "provisionersftw",
+					LicenseOptions: &coderdenttest.LicenseOptions{
+						Features: license.Features{
+							codersdk.FeatureExternalProvisionerDaemons: 1,
+							codersdk.FeatureMultipleOrganizations:      1,
+						},
+					},
+				})
+				ctx := testutil.Context(t, testutil.WaitShort)
+
+				org := coderdenttest.CreateOrganization(t, client, coderdenttest.CreateOrganizationOptions{
+					IncludeProvisionerDaemon: false,
+				})
+				orgTemplateAdmin, _ := coderdtest.CreateAnotherUser(t, client, org.ID, rbac.ScopedRoleOrgTemplateAdmin(org.ID))
+
+				daemonCreatedAt := time.Now()
+
+				//nolint:gocritic // We're not testing auth on the following in this test
+				provisionerKey, err := db.InsertProvisionerKey(dbauthz.AsSystemRestricted(ctx), database.InsertProvisionerKeyParams{
+					Name:           "Test Provisioner Key",
+					ID:             uuid.New(),
+					CreatedAt:      daemonCreatedAt,
+					OrganizationID: org.ID,
+					HashedSecret:   []byte{},
+					Tags:           tt.provisionerDaemonTags,
+				})
+				require.NoError(t, err, "should be able to create a provisioner key")
+
+				//nolint:gocritic // We're not testing auth on the following in this test
+				pd, err := db.UpsertProvisionerDaemon(dbauthz.AsSystemRestricted(ctx), database.UpsertProvisionerDaemonParams{
+					CreatedAt:    daemonCreatedAt,
+					Name:         "Test Provisioner Daemon",
+					Provisioners: []database.ProvisionerType{},
+					Tags:         tt.provisionerDaemonTags,
+					LastSeenAt: sql.NullTime{
+						Time:  daemonCreatedAt,
+						Valid: true,
+					},
+					Version:        "",
+					OrganizationID: org.ID,
+					APIVersion:     "",
+					KeyID:          provisionerKey.ID,
+				})
+				require.NoError(t, err, "should be able to create provisioner daemon")
+				daemonAsCreated := db2sdk.ProvisionerDaemon(pd)
+
+				allDaemons, err := orgTemplateAdmin.OrganizationProvisionerDaemons(ctx, org.ID, nil)
+				require.NoError(t, err)
+				require.Len(t, allDaemons, 1)
+
+				daemonsAsFound, err := orgTemplateAdmin.OrganizationProvisionerDaemons(ctx, org.ID, &codersdk.OrganizationProvisionerDaemonsOptions{
+					Tags: tt.tagsToFilterBy,
+				})
+				if tt.expectToGetDaemon {
+					require.NoError(t, err)
+					require.Len(t, daemonsAsFound, 1)
+					require.Equal(t, daemonAsCreated.Tags, daemonsAsFound[0].Tags, "found daemon should have the same tags as created daemon")
+					require.Equal(t, daemonsAsFound[0].KeyID, provisionerKey.ID)
+				} else {
+					require.NoError(t, err)
+					assert.Empty(t, daemonsAsFound, "should not have found daemon")
+				}
+			})
 		}
 	})
 }

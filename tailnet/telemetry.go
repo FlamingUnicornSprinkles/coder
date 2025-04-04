@@ -39,8 +39,7 @@ type TelemetryStore struct {
 	application   string
 
 	// nil if not connected
-	connSetupTime *durationpb.Duration
-	connectedIP   *netip.Addr
+	connectedIP *netip.Addr
 	// 0 if not connected
 	nodeIDRemote uint64
 	p2p          bool
@@ -66,15 +65,14 @@ func (b *TelemetryStore) newEvent() *proto.TelemetryEvent {
 	defer b.mu.Unlock()
 
 	out := &proto.TelemetryEvent{
-		Time:            timestamppb.Now(),
-		ClientVersion:   buildinfo.Version(),
-		DerpMap:         DERPMapToProto(b.cleanDerpMap),
-		LatestNetcheck:  b.cleanNetCheck,
-		NodeIdSelf:      b.nodeIDSelf,
-		NodeIdRemote:    b.nodeIDRemote,
-		HomeDerp:        b.homeDerp,
-		ConnectionSetup: b.connSetupTime,
-		Application:     b.application,
+		Time:           timestamppb.Now(),
+		ClientVersion:  buildinfo.Version(),
+		DerpMap:        DERPMapToProto(b.cleanDerpMap),
+		LatestNetcheck: b.cleanNetCheck,
+		NodeIdSelf:     b.nodeIDSelf,
+		NodeIdRemote:   b.nodeIDRemote,
+		HomeDerp:       b.homeDerp,
+		Application:    b.application,
 	}
 	if b.p2pSetupTime > 0 {
 		out.P2PSetup = durationpb.New(b.p2pSetupTime)
@@ -108,13 +106,14 @@ func (b *TelemetryStore) changedConntype(addr string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.p2p && addr != "" {
+	switch {
+	case b.p2p && addr != "":
 		return false
-	} else if !b.p2p && addr != "" {
+	case !b.p2p && addr != "":
 		b.p2p = true
 		b.p2pSetupTime = time.Since(b.lastDerpTime)
 		return true
-	} else if b.p2p && addr == "" {
+	case b.p2p && addr == "":
 		b.p2p = false
 		b.lastDerpTime = time.Now()
 		b.p2pSetupTime = 0
@@ -133,6 +132,7 @@ func (b *TelemetryStore) updateRemoteNodeIDLocked(nm *netmap.NetworkMap) {
 	for _, p := range nm.Peers {
 		for _, a := range p.Addresses {
 			if a.Addr() == ip && a.IsSingleIP() {
+				// #nosec G115 - Safe conversion as p.ID is expected to be within uint64 range for node IDs
 				b.nodeIDRemote = uint64(p.ID)
 			}
 		}
@@ -190,6 +190,7 @@ func (b *TelemetryStore) updateByNodeLocked(n *tailcfg.Node) bool {
 	if n == nil {
 		return false
 	}
+	// #nosec G115 - Safe conversion as n.ID is expected to be within uint64 range for node IDs
 	b.nodeIDSelf = uint64(n.ID)
 	derpIP, err := netip.ParseAddrPort(n.DERP)
 	if err != nil {

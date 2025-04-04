@@ -54,7 +54,9 @@ func (api *API) auditLogs(rw http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// #nosec G115 - Safe conversion as pagination offset is expected to be within int32 range
 	filter.OffsetOpt = int32(page.Offset)
+	// #nosec G115 - Safe conversion as pagination limit is expected to be within int32 range
 	filter.LimitOpt = int32(page.Limit)
 
 	if filter.Username == "me" {
@@ -159,7 +161,7 @@ func (api *API) generateFakeAuditLog(rw http.ResponseWriter, r *http.Request) {
 		Diff:             diff,
 		StatusCode:       http.StatusOK,
 		AdditionalFields: params.AdditionalFields,
-		RequestID:        uuid.Nil, // no request ID to attach this to
+		RequestID:        params.RequestID,
 		ResourceIcon:     "",
 		OrganizationID:   params.OrganizationID,
 	})
@@ -182,17 +184,17 @@ func (api *API) convertAuditLogs(ctx context.Context, dblogs []database.GetAudit
 }
 
 func (api *API) convertAuditLog(ctx context.Context, dblog database.GetAuditLogsOffsetRow) codersdk.AuditLog {
-	ip, _ := netip.AddrFromSlice(dblog.Ip.IPNet.IP)
+	ip, _ := netip.AddrFromSlice(dblog.AuditLog.Ip.IPNet.IP)
 
 	diff := codersdk.AuditDiff{}
-	_ = json.Unmarshal(dblog.Diff, &diff)
+	_ = json.Unmarshal(dblog.AuditLog.Diff, &diff)
 
 	var user *codersdk.User
 	if dblog.UserUsername.Valid {
 		// Leaving the organization IDs blank for now; not sure they are useful for
 		// the audit query anyway?
 		sdkUser := db2sdk.User(database.User{
-			ID:                 dblog.UserID,
+			ID:                 dblog.AuditLog.UserID,
 			Email:              dblog.UserEmail.String,
 			Username:           dblog.UserUsername.String,
 			CreatedAt:          dblog.UserCreatedAt.Time,
@@ -204,14 +206,13 @@ func (api *API) convertAuditLog(ctx context.Context, dblog database.GetAuditLogs
 			Deleted:            dblog.UserDeleted.Bool,
 			LastSeenAt:         dblog.UserLastSeenAt.Time,
 			QuietHoursSchedule: dblog.UserQuietHoursSchedule.String,
-			ThemePreference:    dblog.UserThemePreference.String,
 			Name:               dblog.UserName.String,
 		}, []uuid.UUID{})
 		user = &sdkUser
 	}
 
 	var (
-		additionalFieldsBytes = []byte(dblog.AdditionalFields)
+		additionalFieldsBytes = []byte(dblog.AuditLog.AdditionalFields)
 		additionalFields      audit.AdditionalFields
 		err                   = json.Unmarshal(additionalFieldsBytes, &additionalFields)
 	)
@@ -224,7 +225,7 @@ func (api *API) convertAuditLog(ctx context.Context, dblog database.GetAuditLogs
 			WorkspaceOwner: "unknown",
 		}
 
-		dblog.AdditionalFields, err = json.Marshal(resourceInfo)
+		dblog.AuditLog.AdditionalFields, err = json.Marshal(resourceInfo)
 		api.Logger.Error(ctx, "marshal additional fields", slog.Error(err))
 	}
 
@@ -239,30 +240,30 @@ func (api *API) convertAuditLog(ctx context.Context, dblog database.GetAuditLogs
 	}
 
 	alog := codersdk.AuditLog{
-		ID:        dblog.ID,
-		RequestID: dblog.RequestID,
-		Time:      dblog.Time,
+		ID:        dblog.AuditLog.ID,
+		RequestID: dblog.AuditLog.RequestID,
+		Time:      dblog.AuditLog.Time,
 		// OrganizationID is deprecated.
-		OrganizationID:   dblog.OrganizationID,
+		OrganizationID:   dblog.AuditLog.OrganizationID,
 		IP:               ip,
-		UserAgent:        dblog.UserAgent.String,
-		ResourceType:     codersdk.ResourceType(dblog.ResourceType),
-		ResourceID:       dblog.ResourceID,
-		ResourceTarget:   dblog.ResourceTarget,
-		ResourceIcon:     dblog.ResourceIcon,
-		Action:           codersdk.AuditAction(dblog.Action),
+		UserAgent:        dblog.AuditLog.UserAgent.String,
+		ResourceType:     codersdk.ResourceType(dblog.AuditLog.ResourceType),
+		ResourceID:       dblog.AuditLog.ResourceID,
+		ResourceTarget:   dblog.AuditLog.ResourceTarget,
+		ResourceIcon:     dblog.AuditLog.ResourceIcon,
+		Action:           codersdk.AuditAction(dblog.AuditLog.Action),
 		Diff:             diff,
-		StatusCode:       dblog.StatusCode,
-		AdditionalFields: dblog.AdditionalFields,
+		StatusCode:       dblog.AuditLog.StatusCode,
+		AdditionalFields: dblog.AuditLog.AdditionalFields,
 		User:             user,
 		Description:      auditLogDescription(dblog),
 		ResourceLink:     resourceLink,
 		IsDeleted:        isDeleted,
 	}
 
-	if dblog.OrganizationID != uuid.Nil {
+	if dblog.AuditLog.OrganizationID != uuid.Nil {
 		alog.Organization = &codersdk.MinimalOrganization{
-			ID:          dblog.OrganizationID,
+			ID:          dblog.AuditLog.OrganizationID,
 			Name:        dblog.OrganizationName,
 			DisplayName: dblog.OrganizationDisplayName,
 			Icon:        dblog.OrganizationIcon,
@@ -274,34 +275,49 @@ func (api *API) convertAuditLog(ctx context.Context, dblog database.GetAuditLogs
 
 func auditLogDescription(alog database.GetAuditLogsOffsetRow) string {
 	b := strings.Builder{}
+
 	// NOTE: WriteString always returns a nil error, so we never check it
-	_, _ = b.WriteString("{user} ")
-	if alog.StatusCode >= 400 {
+
+	// Requesting a password reset can be performed by anyone that knows the email
+	// of a user so saying the user performed this action might be slightly misleading.
+	if alog.AuditLog.Action != database.AuditActionRequestPasswordReset {
+		_, _ = b.WriteString("{user} ")
+	}
+
+	switch {
+	case alog.AuditLog.StatusCode == int32(http.StatusSeeOther):
+		_, _ = b.WriteString("was redirected attempting to ")
+		_, _ = b.WriteString(string(alog.AuditLog.Action))
+	case alog.AuditLog.StatusCode >= 400:
 		_, _ = b.WriteString("unsuccessfully attempted to ")
-		_, _ = b.WriteString(string(alog.Action))
-	} else {
-		_, _ = b.WriteString(codersdk.AuditAction(alog.Action).Friendly())
+		_, _ = b.WriteString(string(alog.AuditLog.Action))
+	default:
+		_, _ = b.WriteString(codersdk.AuditAction(alog.AuditLog.Action).Friendly())
 	}
 
 	// API Key resources (used for authentication) do not have targets and follow the below format:
 	// "User {logged in | logged out | registered}"
-	if alog.ResourceType == database.ResourceTypeApiKey &&
-		(alog.Action == database.AuditActionLogin || alog.Action == database.AuditActionLogout || alog.Action == database.AuditActionRegister) {
+	if alog.AuditLog.ResourceType == database.ResourceTypeApiKey &&
+		(alog.AuditLog.Action == database.AuditActionLogin || alog.AuditLog.Action == database.AuditActionLogout || alog.AuditLog.Action == database.AuditActionRegister) {
 		return b.String()
 	}
 
 	// We don't display the name (target) for git ssh keys. It's fairly long and doesn't
 	// make too much sense to display.
-	if alog.ResourceType == database.ResourceTypeGitSshKey {
+	if alog.AuditLog.ResourceType == database.ResourceTypeGitSshKey {
 		_, _ = b.WriteString(" the ")
-		_, _ = b.WriteString(codersdk.ResourceType(alog.ResourceType).FriendlyString())
+		_, _ = b.WriteString(codersdk.ResourceType(alog.AuditLog.ResourceType).FriendlyString())
 		return b.String()
 	}
 
-	_, _ = b.WriteString(" ")
-	_, _ = b.WriteString(codersdk.ResourceType(alog.ResourceType).FriendlyString())
+	if alog.AuditLog.Action == database.AuditActionRequestPasswordReset {
+		_, _ = b.WriteString(" for")
+	} else {
+		_, _ = b.WriteString(" ")
+		_, _ = b.WriteString(codersdk.ResourceType(alog.AuditLog.ResourceType).FriendlyString())
+	}
 
-	if alog.ResourceType == database.ResourceTypeConvertLogin {
+	if alog.AuditLog.ResourceType == database.ResourceTypeConvertLogin {
 		_, _ = b.WriteString(" to")
 	}
 
@@ -311,9 +327,9 @@ func auditLogDescription(alog database.GetAuditLogsOffsetRow) string {
 }
 
 func (api *API) auditLogIsResourceDeleted(ctx context.Context, alog database.GetAuditLogsOffsetRow) bool {
-	switch alog.ResourceType {
+	switch alog.AuditLog.ResourceType {
 	case database.ResourceTypeTemplate:
-		template, err := api.Database.GetTemplateByID(ctx, alog.ResourceID)
+		template, err := api.Database.GetTemplateByID(ctx, alog.AuditLog.ResourceID)
 		if err != nil {
 			if xerrors.Is(err, sql.ErrNoRows) {
 				return true
@@ -322,7 +338,7 @@ func (api *API) auditLogIsResourceDeleted(ctx context.Context, alog database.Get
 		}
 		return template.Deleted
 	case database.ResourceTypeUser:
-		user, err := api.Database.GetUserByID(ctx, alog.ResourceID)
+		user, err := api.Database.GetUserByID(ctx, alog.AuditLog.ResourceID)
 		if err != nil {
 			if xerrors.Is(err, sql.ErrNoRows) {
 				return true
@@ -331,7 +347,7 @@ func (api *API) auditLogIsResourceDeleted(ctx context.Context, alog database.Get
 		}
 		return user.Deleted
 	case database.ResourceTypeWorkspace:
-		workspace, err := api.Database.GetWorkspaceByID(ctx, alog.ResourceID)
+		workspace, err := api.Database.GetWorkspaceByID(ctx, alog.AuditLog.ResourceID)
 		if err != nil {
 			if xerrors.Is(err, sql.ErrNoRows) {
 				return true
@@ -340,7 +356,7 @@ func (api *API) auditLogIsResourceDeleted(ctx context.Context, alog database.Get
 		}
 		return workspace.Deleted
 	case database.ResourceTypeWorkspaceBuild:
-		workspaceBuild, err := api.Database.GetWorkspaceBuildByID(ctx, alog.ResourceID)
+		workspaceBuild, err := api.Database.GetWorkspaceBuildByID(ctx, alog.AuditLog.ResourceID)
 		if err != nil {
 			if xerrors.Is(err, sql.ErrNoRows) {
 				return true
@@ -356,8 +372,28 @@ func (api *API) auditLogIsResourceDeleted(ctx context.Context, alog database.Get
 			api.Logger.Error(ctx, "unable to fetch workspace", slog.Error(err))
 		}
 		return workspace.Deleted
+	case database.ResourceTypeWorkspaceAgent:
+		// We use workspace as a proxy for workspace agents.
+		workspace, err := api.Database.GetWorkspaceByAgentID(ctx, alog.AuditLog.ResourceID)
+		if err != nil {
+			if xerrors.Is(err, sql.ErrNoRows) {
+				return true
+			}
+			api.Logger.Error(ctx, "unable to fetch workspace", slog.Error(err))
+		}
+		return workspace.Deleted
+	case database.ResourceTypeWorkspaceApp:
+		// We use workspace as a proxy for workspace apps.
+		workspace, err := api.Database.GetWorkspaceByWorkspaceAppID(ctx, alog.AuditLog.ResourceID)
+		if err != nil {
+			if xerrors.Is(err, sql.ErrNoRows) {
+				return true
+			}
+			api.Logger.Error(ctx, "unable to fetch workspace", slog.Error(err))
+		}
+		return workspace.Deleted
 	case database.ResourceTypeOauth2ProviderApp:
-		_, err := api.Database.GetOAuth2ProviderAppByID(ctx, alog.ResourceID)
+		_, err := api.Database.GetOAuth2ProviderAppByID(ctx, alog.AuditLog.ResourceID)
 		if xerrors.Is(err, sql.ErrNoRows) {
 			return true
 		} else if err != nil {
@@ -365,7 +401,7 @@ func (api *API) auditLogIsResourceDeleted(ctx context.Context, alog database.Get
 		}
 		return false
 	case database.ResourceTypeOauth2ProviderAppSecret:
-		_, err := api.Database.GetOAuth2ProviderAppSecretByID(ctx, alog.ResourceID)
+		_, err := api.Database.GetOAuth2ProviderAppSecretByID(ctx, alog.AuditLog.ResourceID)
 		if xerrors.Is(err, sql.ErrNoRows) {
 			return true
 		} else if err != nil {
@@ -378,17 +414,17 @@ func (api *API) auditLogIsResourceDeleted(ctx context.Context, alog database.Get
 }
 
 func (api *API) auditLogResourceLink(ctx context.Context, alog database.GetAuditLogsOffsetRow, additionalFields audit.AdditionalFields) string {
-	switch alog.ResourceType {
+	switch alog.AuditLog.ResourceType {
 	case database.ResourceTypeTemplate:
 		return fmt.Sprintf("/templates/%s",
-			alog.ResourceTarget)
+			alog.AuditLog.ResourceTarget)
 
 	case database.ResourceTypeUser:
 		return fmt.Sprintf("/users?filter=%s",
-			alog.ResourceTarget)
+			alog.AuditLog.ResourceTarget)
 
 	case database.ResourceTypeWorkspace:
-		workspace, getWorkspaceErr := api.Database.GetWorkspaceByID(ctx, alog.ResourceID)
+		workspace, getWorkspaceErr := api.Database.GetWorkspaceByID(ctx, alog.AuditLog.ResourceID)
 		if getWorkspaceErr != nil {
 			return ""
 		}
@@ -397,13 +433,13 @@ func (api *API) auditLogResourceLink(ctx context.Context, alog database.GetAudit
 			return ""
 		}
 		return fmt.Sprintf("/@%s/%s",
-			workspaceOwner.Username, alog.ResourceTarget)
+			workspaceOwner.Username, alog.AuditLog.ResourceTarget)
 
 	case database.ResourceTypeWorkspaceBuild:
 		if len(additionalFields.WorkspaceName) == 0 || len(additionalFields.BuildNumber) == 0 {
 			return ""
 		}
-		workspaceBuild, getWorkspaceBuildErr := api.Database.GetWorkspaceBuildByID(ctx, alog.ResourceID)
+		workspaceBuild, getWorkspaceBuildErr := api.Database.GetWorkspaceBuildByID(ctx, alog.AuditLog.ResourceID)
 		if getWorkspaceBuildErr != nil {
 			return ""
 		}
@@ -418,11 +454,31 @@ func (api *API) auditLogResourceLink(ctx context.Context, alog database.GetAudit
 		return fmt.Sprintf("/@%s/%s/builds/%s",
 			workspaceOwner.Username, additionalFields.WorkspaceName, additionalFields.BuildNumber)
 
+	case database.ResourceTypeWorkspaceAgent:
+		if additionalFields.WorkspaceOwner != "" && additionalFields.WorkspaceName != "" {
+			return fmt.Sprintf("/@%s/%s", additionalFields.WorkspaceOwner, additionalFields.WorkspaceName)
+		}
+		workspace, getWorkspaceErr := api.Database.GetWorkspaceByAgentID(ctx, alog.AuditLog.ResourceID)
+		if getWorkspaceErr != nil {
+			return ""
+		}
+		return fmt.Sprintf("/@%s/%s", workspace.OwnerUsername, workspace.Name)
+
+	case database.ResourceTypeWorkspaceApp:
+		if additionalFields.WorkspaceOwner != "" && additionalFields.WorkspaceName != "" {
+			return fmt.Sprintf("/@%s/%s", additionalFields.WorkspaceOwner, additionalFields.WorkspaceName)
+		}
+		workspace, getWorkspaceErr := api.Database.GetWorkspaceByWorkspaceAppID(ctx, alog.AuditLog.ResourceID)
+		if getWorkspaceErr != nil {
+			return ""
+		}
+		return fmt.Sprintf("/@%s/%s", workspace.OwnerUsername, workspace.Name)
+
 	case database.ResourceTypeOauth2ProviderApp:
-		return fmt.Sprintf("/deployment/oauth2-provider/apps/%s", alog.ResourceID)
+		return fmt.Sprintf("/deployment/oauth2-provider/apps/%s", alog.AuditLog.ResourceID)
 
 	case database.ResourceTypeOauth2ProviderAppSecret:
-		secret, err := api.Database.GetOAuth2ProviderAppSecretByID(ctx, alog.ResourceID)
+		secret, err := api.Database.GetOAuth2ProviderAppSecretByID(ctx, alog.AuditLog.ResourceID)
 		if err != nil {
 			return ""
 		}

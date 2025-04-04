@@ -26,7 +26,7 @@ func TestList(t *testing.T) {
 		owner := coderdtest.CreateFirstUser(t, client)
 		member, memberUser := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID)
 		// setup template
-		r := dbfake.WorkspaceBuild(t, db, database.Workspace{
+		r := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
 			OrganizationID: owner.OrganizationID,
 			OwnerID:        memberUser.ID,
 		}).WithAgent().Do()
@@ -54,7 +54,7 @@ func TestList(t *testing.T) {
 		client, db := coderdtest.NewWithDatabase(t, nil)
 		owner := coderdtest.CreateFirstUser(t, client)
 		member, memberUser := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID)
-		_ = dbfake.WorkspaceBuild(t, db, database.Workspace{
+		_ = dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
 			OrganizationID: owner.OrganizationID,
 			OwnerID:        memberUser.ID,
 		}).WithAgent().Do()
@@ -73,5 +73,31 @@ func TestList(t *testing.T) {
 		var workspaces []codersdk.Workspace
 		require.NoError(t, json.Unmarshal(out.Bytes(), &workspaces))
 		require.Len(t, workspaces, 1)
+	})
+
+	t.Run("NoWorkspacesJSON", func(t *testing.T) {
+		t.Parallel()
+		client := coderdtest.New(t, nil)
+		owner := coderdtest.CreateFirstUser(t, client)
+		member, _ := coderdtest.CreateAnotherUser(t, client, owner.OrganizationID)
+
+		inv, root := clitest.New(t, "list", "--output=json")
+		clitest.SetupConfig(t, member, root)
+
+		ctx, cancelFunc := context.WithTimeout(context.Background(), testutil.WaitLong)
+		defer cancelFunc()
+
+		stdout := bytes.NewBuffer(nil)
+		stderr := bytes.NewBuffer(nil)
+		inv.Stdout = stdout
+		inv.Stderr = stderr
+		err := inv.WithContext(ctx).Run()
+		require.NoError(t, err)
+
+		var workspaces []codersdk.Workspace
+		require.NoError(t, json.Unmarshal(stdout.Bytes(), &workspaces))
+		require.Len(t, workspaces, 0)
+
+		require.Len(t, stderr.Bytes(), 0)
 	})
 }

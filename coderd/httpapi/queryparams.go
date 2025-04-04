@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -81,6 +82,20 @@ func (p *QueryParamParser) Int(vals url.Values, def int, queryParam string) int 
 	return v
 }
 
+func (p *QueryParamParser) Int64(vals url.Values, def int64, queryParam string) int64 {
+	v, err := parseQueryParam(p, vals, func(v string) (int64, error) {
+		return strconv.ParseInt(v, 10, 64)
+	}, def, queryParam)
+	if err != nil {
+		p.Errors = append(p.Errors, codersdk.ValidationError{
+			Field:  queryParam,
+			Detail: fmt.Sprintf("Query param %q must be a valid 64-bit integer: %s", queryParam, err.Error()),
+		})
+		return 0
+	}
+	return v
+}
+
 // PositiveInt32 function checks if the given value is 32-bit and positive.
 //
 // We can't use `uint32` as the value must be within the range  <0,2147483647>
@@ -144,6 +159,19 @@ func (p *QueryParamParser) RequiredNotEmpty(queryParam ...string) *QueryParamPar
 	return p
 }
 
+// UUIDorName will parse a string as a UUID, if it fails, it uses the "fetchByName"
+// function to return a UUID based on the value as a string.
+// This is useful when fetching something like an organization by ID or by name.
+func (p *QueryParamParser) UUIDorName(vals url.Values, def uuid.UUID, queryParam string, fetchByName func(name string) (uuid.UUID, error)) uuid.UUID {
+	return ParseCustom(p, vals, def, queryParam, func(v string) (uuid.UUID, error) {
+		id, err := uuid.Parse(v)
+		if err == nil {
+			return id, nil
+		}
+		return fetchByName(v)
+	})
+}
+
 func (p *QueryParamParser) UUIDorMe(vals url.Values, def uuid.UUID, me uuid.UUID, queryParam string) uuid.UUID {
 	return ParseCustom(p, vals, def, queryParam, func(v string) (uuid.UUID, error) {
 		if v == "me" {
@@ -198,11 +226,9 @@ func (p *QueryParamParser) Time(vals url.Values, def time.Time, queryParam, layo
 // Time uses the default time format of RFC3339Nano and always returns a UTC time.
 func (p *QueryParamParser) Time3339Nano(vals url.Values, def time.Time, queryParam string) time.Time {
 	layout := time.RFC3339Nano
-	return p.timeWithMutate(vals, def, queryParam, layout, func(term string) string {
-		// All search queries are forced to lowercase. But the RFC format requires
-		// upper case letters. So just uppercase the term.
-		return strings.ToUpper(term)
-	})
+	// All search queries are forced to lowercase. But the RFC format requires
+	// upper case letters. So just uppercase the term.
+	return p.timeWithMutate(vals, def, queryParam, layout, strings.ToUpper)
 }
 
 func (p *QueryParamParser) timeWithMutate(vals url.Values, def time.Time, queryParam, layout string, mutate func(term string) string) time.Time {
@@ -242,6 +268,23 @@ func (p *QueryParamParser) Strings(vals url.Values, def []string, queryParam str
 	return ParseCustomList(p, vals, def, queryParam, func(v string) (string, error) {
 		return v, nil
 	})
+}
+
+func (p *QueryParamParser) JSONStringMap(vals url.Values, def map[string]string, queryParam string) map[string]string {
+	v, err := parseQueryParam(p, vals, func(v string) (map[string]string, error) {
+		var m map[string]string
+		if err := json.NewDecoder(strings.NewReader(v)).Decode(&m); err != nil {
+			return nil, err
+		}
+		return m, nil
+	}, def, queryParam)
+	if err != nil {
+		p.Errors = append(p.Errors, codersdk.ValidationError{
+			Field:  queryParam,
+			Detail: fmt.Sprintf("Query param %q must be a valid JSON object: %s", queryParam, err.Error()),
+		})
+	}
+	return v
 }
 
 // ValidEnum represents an enum that can be parsed and validated.

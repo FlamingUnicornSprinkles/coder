@@ -19,10 +19,10 @@ import (
 	"golang.org/x/xerrors"
 
 	"cdr.dev/slog"
-	"cdr.dev/slog/sloggers/slogtest"
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbmem"
 	"github.com/coder/coder/v2/coderd/database/pubsub"
+	"github.com/coder/coder/v2/testutil"
 )
 
 // WillUsePostgres returns true if a call to NewDB() will return a real, postgres-backed Store and Pubsub.
@@ -35,6 +35,7 @@ type options struct {
 	dumpOnFailure bool
 	returnSQLDB   func(*sql.DB)
 	logger        slog.Logger
+	url           string
 }
 
 type Option func(*options)
@@ -59,6 +60,12 @@ func WithLogger(logger slog.Logger) Option {
 	}
 }
 
+func WithURL(u string) Option {
+	return func(o *options) {
+		o.url = u
+	}
+}
+
 func withReturnSQLDB(f func(*sql.DB)) Option {
 	return func(o *options) {
 		o.returnSQLDB = f
@@ -80,26 +87,37 @@ func NewDBWithSQLDB(t testing.TB, opts ...Option) (database.Store, pubsub.Pubsub
 	return db, ps, sqlDB
 }
 
+var DefaultTimezone = "Canada/Newfoundland"
+
+// NowInDefaultTimezone returns the current time rounded to the nearest microsecond in the default timezone
+// used by postgres in tests. Useful for object equality checks.
+func NowInDefaultTimezone() time.Time {
+	loc, err := time.LoadLocation(DefaultTimezone)
+	if err != nil {
+		panic(err)
+	}
+	return time.Now().In(loc).Round(time.Microsecond)
+}
+
 func NewDB(t testing.TB, opts ...Option) (database.Store, pubsub.Pubsub) {
 	t.Helper()
 
-	o := options{logger: slogtest.Make(t, nil).Named("pubsub").Leveled(slog.LevelDebug)}
+	o := options{logger: testutil.Logger(t).Named("pubsub")}
 	for _, opt := range opts {
 		opt(&o)
 	}
 
-	db := dbmem.New()
-	ps := pubsub.NewInMemory()
+	var db database.Store
+	var ps pubsub.Pubsub
 	if WillUsePostgres() {
 		connectionURL := os.Getenv("CODER_PG_CONNECTION_URL")
+		if connectionURL == "" && o.url != "" {
+			connectionURL = o.url
+		}
 		if connectionURL == "" {
-			var (
-				err     error
-				closePg func()
-			)
-			connectionURL, closePg, err = Open()
+			var err error
+			connectionURL, err = Open(t)
 			require.NoError(t, err)
-			t.Cleanup(closePg)
 		}
 
 		if o.fixedTimezone == "" {
@@ -109,7 +127,7 @@ func NewDB(t testing.TB, opts ...Option) (database.Store, pubsub.Pubsub) {
 			// - It has a non-UTC offset
 			// - It has a fractional hour UTC offset
 			// - It includes a daylight savings time component
-			o.fixedTimezone = "Canada/Newfoundland"
+			o.fixedTimezone = DefaultTimezone
 		}
 		dbName := dbNameFromConnectionURL(t, connectionURL)
 		setDBTimezone(t, connectionURL, dbName, o.fixedTimezone)
@@ -125,13 +143,17 @@ func NewDB(t testing.TB, opts ...Option) (database.Store, pubsub.Pubsub) {
 		if o.dumpOnFailure {
 			t.Cleanup(func() { DumpOnFailure(t, connectionURL) })
 		}
-		db = database.New(sqlDB)
+		// Unit tests should not retry serial transaction failures.
+		db = database.New(sqlDB, database.WithSerialRetryCount(1))
 
 		ps, err = pubsub.New(context.Background(), o.logger, sqlDB, connectionURL)
 		require.NoError(t, err)
 		t.Cleanup(func() {
 			_ = ps.Close()
 		})
+	} else {
+		db = dbmem.New()
+		ps = pubsub.NewInMemory()
 	}
 
 	return db, ps
@@ -307,4 +329,16 @@ func normalizeDump(schema []byte) []byte {
 	schema = regexp.MustCompile(`(?im)\n{3,}`).ReplaceAll(schema, []byte("\n\n"))
 
 	return schema
+}
+
+// Deprecated: disable foreign keys was created to aid in migrating off
+// of the test-only in-memory database. Do not use this in new code.
+func DisableForeignKeysAndTriggers(t *testing.T, db database.Store) {
+	err := db.DisableForeignKeysAndTriggers(context.Background())
+	if t != nil {
+		require.NoError(t, err)
+	}
+	if err != nil {
+		panic(err)
+	}
 }

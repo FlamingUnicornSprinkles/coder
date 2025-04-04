@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -20,6 +21,8 @@ import (
 
 	"github.com/coder/coder/v2/coderd/audit"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/db2sdk"
+	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/coderd/database/provisionerjobs"
 	"github.com/coder/coder/v2/coderd/externalauth"
@@ -30,8 +33,10 @@ import (
 	"github.com/coder/coder/v2/coderd/rbac/policy"
 	"github.com/coder/coder/v2/coderd/render"
 	"github.com/coder/coder/v2/coderd/tracing"
+	"github.com/coder/coder/v2/coderd/util/ptr"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/examples"
+	"github.com/coder/coder/v2/provisioner/terraform/tfparse"
 	"github.com/coder/coder/v2/provisionersdk"
 	sdkproto "github.com/coder/coder/v2/provisionersdk/proto"
 )
@@ -57,6 +62,22 @@ func (api *API) templateVersion(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var matchedProvisioners *codersdk.MatchedProvisioners
+	if jobs[0].ProvisionerJob.JobStatus == database.ProvisionerJobStatusPending {
+		// nolint: gocritic // The user hitting this endpoint may not have
+		// permission to read provisioner daemons, but we want to show them
+		// information about the provisioner daemons that are available.
+		provisioners, err := api.Database.GetProvisionerDaemonsByOrganization(dbauthz.AsSystemReadProvisionerDaemons(ctx), database.GetProvisionerDaemonsByOrganizationParams{
+			OrganizationID: jobs[0].ProvisionerJob.OrganizationID,
+			WantTags:       jobs[0].ProvisionerJob.Tags,
+		})
+		if err != nil {
+			api.Logger.Error(ctx, "failed to fetch provisioners for job id", slog.F("job_id", jobs[0].ProvisionerJob.ID), slog.Error(err))
+		} else {
+			matchedProvisioners = ptr.Ref(db2sdk.MatchedProvisioners(provisioners, dbtime.Now(), provisionerdserver.StaleInterval))
+		}
+	}
+
 	schemas, err := api.Database.GetParameterSchemasByJobID(ctx, jobs[0].ProvisionerJob.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = nil
@@ -74,7 +95,7 @@ func (api *API) templateVersion(rw http.ResponseWriter, r *http.Request) {
 		warnings = append(warnings, codersdk.TemplateVersionWarningUnsupportedWorkspaces)
 	}
 
-	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(templateVersion, convertProvisionerJob(jobs[0]), warnings))
+	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(templateVersion, convertProvisionerJob(jobs[0]), matchedProvisioners, warnings))
 }
 
 // @Summary Patch template version by ID
@@ -170,7 +191,23 @@ func (api *API) patchTemplateVersion(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(updatedTemplateVersion, convertProvisionerJob(jobs[0]), nil))
+	var matchedProvisioners *codersdk.MatchedProvisioners
+	if jobs[0].ProvisionerJob.JobStatus == database.ProvisionerJobStatusPending {
+		// nolint: gocritic // The user hitting this endpoint may not have
+		// permission to read provisioner daemons, but we want to show them
+		// information about the provisioner daemons that are available.
+		provisioners, err := api.Database.GetProvisionerDaemonsByOrganization(dbauthz.AsSystemReadProvisionerDaemons(ctx), database.GetProvisionerDaemonsByOrganizationParams{
+			OrganizationID: jobs[0].ProvisionerJob.OrganizationID,
+			WantTags:       jobs[0].ProvisionerJob.Tags,
+		})
+		if err != nil {
+			api.Logger.Error(ctx, "failed to fetch provisioners for job id", slog.F("job_id", jobs[0].ProvisionerJob.ID), slog.Error(err))
+		} else {
+			matchedProvisioners = ptr.Ref(db2sdk.MatchedProvisioners(provisioners, dbtime.Now(), provisionerdserver.StaleInterval))
+		}
+	}
+
+	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(updatedTemplateVersion, convertProvisionerJob(jobs[0]), matchedProvisioners, nil))
 }
 
 // @Summary Cancel template version by ID
@@ -543,6 +580,43 @@ func (api *API) templateVersionDryRun(rw http.ResponseWriter, r *http.Request) {
 	httpapi.Write(ctx, rw, http.StatusOK, convertProvisionerJob(job))
 }
 
+// @Summary Get template version dry-run matched provisioners
+// @ID get-template-version-dry-run-matched-provisioners
+// @Security CoderSessionToken
+// @Produce json
+// @Tags Templates
+// @Param templateversion path string true "Template version ID" format(uuid)
+// @Param jobID path string true "Job ID" format(uuid)
+// @Success 200 {object} codersdk.MatchedProvisioners
+// @Router /templateversions/{templateversion}/dry-run/{jobID}/matched-provisioners [get]
+func (api *API) templateVersionDryRunMatchedProvisioners(rw http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	job, ok := api.fetchTemplateVersionDryRunJob(rw, r)
+	if !ok {
+		return
+	}
+
+	// nolint:gocritic // The user may not have permissions to read all
+	// provisioner daemons in the org.
+	daemons, err := api.Database.GetProvisionerDaemonsByOrganization(dbauthz.AsSystemReadProvisionerDaemons(ctx), database.GetProvisionerDaemonsByOrganizationParams{
+		OrganizationID: job.ProvisionerJob.OrganizationID,
+		WantTags:       job.ProvisionerJob.Tags,
+	})
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+				Message: "Internal error fetching provisioner daemons by organization.",
+				Detail:  err.Error(),
+			})
+			return
+		}
+		daemons = []database.ProvisionerDaemon{}
+	}
+
+	matchedProvisioners := db2sdk.MatchedProvisioners(daemons, dbtime.Now(), provisionerdserver.StaleInterval)
+	httpapi.Write(ctx, rw, http.StatusOK, matchedProvisioners)
+}
+
 // @Summary Get template version dry-run resources by job ID
 // @ID get-template-version-dry-run-resources-by-job-id
 // @Security CoderSessionToken
@@ -769,9 +843,11 @@ func (api *API) templateVersionsByTemplate(rw http.ResponseWriter, r *http.Reque
 		versions, err := store.GetTemplateVersionsByTemplateID(ctx, database.GetTemplateVersionsByTemplateIDParams{
 			TemplateID: template.ID,
 			AfterID:    paginationParams.AfterID,
-			LimitOpt:   int32(paginationParams.Limit),
-			OffsetOpt:  int32(paginationParams.Offset),
-			Archived:   archiveFilter,
+			// #nosec G115 - Pagination limits are small and fit in int32
+			LimitOpt: int32(paginationParams.Limit),
+			// #nosec G115 - Pagination offsets are small and fit in int32
+			OffsetOpt: int32(paginationParams.Offset),
+			Archived:  archiveFilter,
 		})
 		if errors.Is(err, sql.ErrNoRows) {
 			httpapi.Write(ctx, rw, http.StatusOK, apiVersions)
@@ -811,7 +887,7 @@ func (api *API) templateVersionsByTemplate(rw http.ResponseWriter, r *http.Reque
 				return err
 			}
 
-			apiVersions = append(apiVersions, convertTemplateVersion(version, convertProvisionerJob(job), nil))
+			apiVersions = append(apiVersions, convertTemplateVersion(version, convertProvisionerJob(job), nil, nil))
 		}
 
 		return nil
@@ -865,8 +941,23 @@ func (api *API) templateVersionByName(rw http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	var matchedProvisioners *codersdk.MatchedProvisioners
+	if jobs[0].ProvisionerJob.JobStatus == database.ProvisionerJobStatusPending {
+		// nolint: gocritic // The user hitting this endpoint may not have
+		// permission to read provisioner daemons, but we want to show them
+		// information about the provisioner daemons that are available.
+		provisioners, err := api.Database.GetProvisionerDaemonsByOrganization(dbauthz.AsSystemReadProvisionerDaemons(ctx), database.GetProvisionerDaemonsByOrganizationParams{
+			OrganizationID: jobs[0].ProvisionerJob.OrganizationID,
+			WantTags:       jobs[0].ProvisionerJob.Tags,
+		})
+		if err != nil {
+			api.Logger.Error(ctx, "failed to fetch provisioners for job id", slog.F("job_id", jobs[0].ProvisionerJob.ID), slog.Error(err))
+		} else {
+			matchedProvisioners = ptr.Ref(db2sdk.MatchedProvisioners(provisioners, dbtime.Now(), provisionerdserver.StaleInterval))
+		}
+	}
 
-	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(templateVersion, convertProvisionerJob(jobs[0]), nil))
+	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(templateVersion, convertProvisionerJob(jobs[0]), matchedProvisioners, nil))
 }
 
 // @Summary Get template version by organization, template, and name
@@ -931,7 +1022,23 @@ func (api *API) templateVersionByOrganizationTemplateAndName(rw http.ResponseWri
 		return
 	}
 
-	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(templateVersion, convertProvisionerJob(jobs[0]), nil))
+	var matchedProvisioners *codersdk.MatchedProvisioners
+	if jobs[0].ProvisionerJob.JobStatus == database.ProvisionerJobStatusPending {
+		// nolint: gocritic // The user hitting this endpoint may not have
+		// permission to read provisioner daemons, but we want to show them
+		// information about the provisioner daemons that are available.
+		provisioners, err := api.Database.GetProvisionerDaemonsByOrganization(dbauthz.AsSystemReadProvisionerDaemons(ctx), database.GetProvisionerDaemonsByOrganizationParams{
+			OrganizationID: jobs[0].ProvisionerJob.OrganizationID,
+			WantTags:       jobs[0].ProvisionerJob.Tags,
+		})
+		if err != nil {
+			api.Logger.Error(ctx, "failed to fetch provisioners for job id", slog.F("job_id", jobs[0].ProvisionerJob.ID), slog.Error(err))
+		} else {
+			matchedProvisioners = ptr.Ref(db2sdk.MatchedProvisioners(provisioners, dbtime.Now(), provisionerdserver.StaleInterval))
+		}
+	}
+
+	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(templateVersion, convertProvisionerJob(jobs[0]), matchedProvisioners, nil))
 }
 
 // @Summary Get previous template version by organization, template, and name
@@ -1017,7 +1124,23 @@ func (api *API) previousTemplateVersionByOrganizationTemplateAndName(rw http.Res
 		return
 	}
 
-	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(previousTemplateVersion, convertProvisionerJob(jobs[0]), nil))
+	var matchedProvisioners *codersdk.MatchedProvisioners
+	if jobs[0].ProvisionerJob.JobStatus == database.ProvisionerJobStatusPending {
+		// nolint: gocritic // The user hitting this endpoint may not have
+		// permission to read provisioner daemons, but we want to show them
+		// information about the provisioner daemons that are available.
+		provisioners, err := api.Database.GetProvisionerDaemonsByOrganization(dbauthz.AsSystemReadProvisionerDaemons(ctx), database.GetProvisionerDaemonsByOrganizationParams{
+			OrganizationID: jobs[0].ProvisionerJob.OrganizationID,
+			WantTags:       jobs[0].ProvisionerJob.Tags,
+		})
+		if err != nil {
+			api.Logger.Error(ctx, "failed to fetch provisioners for job id", slog.F("job_id", jobs[0].ProvisionerJob.ID), slog.Error(err))
+		} else {
+			matchedProvisioners = ptr.Ref(db2sdk.MatchedProvisioners(provisioners, dbtime.Now(), provisionerdserver.StaleInterval))
+		}
+	}
+
+	httpapi.Write(ctx, rw, http.StatusOK, convertTemplateVersion(previousTemplateVersion, convertProvisionerJob(jobs[0]), matchedProvisioners, nil))
 }
 
 // @Summary Archive template unused versions by template id
@@ -1159,10 +1282,8 @@ func (api *API) setArchiveTemplateVersion(archive bool) func(rw http.ResponseWri
 
 			if archiveError != nil {
 				err = archiveError
-			} else {
-				if len(archived) == 0 {
-					err = xerrors.New("Unable to archive specified version, the version is likely in use by a workspace or currently set to the active version")
-				}
+			} else if len(archived) == 0 {
+				err = xerrors.New("Unable to archive specified version, the version is likely in use by a workspace or currently set to the active version")
 			}
 		} else {
 			err = api.Database.UnarchiveTemplateVersion(ctx, database.UnarchiveTemplateVersionParams{
@@ -1341,9 +1462,6 @@ func (api *API) postTemplateVersionsByOrganization(rw http.ResponseWriter, r *ht
 		}
 	}
 
-	// Ensures the "owner" is properly applied.
-	tags := provisionersdk.MutateTags(apiKey.UserID, req.ProvisionerTags)
-
 	if req.ExampleID != "" && req.FileID != uuid.Nil {
 		httpapi.Write(ctx, rw, http.StatusBadRequest, codersdk.Response{
 			Message: "You cannot specify both an example_id and a file_id.",
@@ -1437,8 +1555,56 @@ func (api *API) postTemplateVersionsByOrganization(rw http.ResponseWriter, r *ht
 		}
 	}
 
+	// Try to parse template tags from the given file.
+	tempDir, err := os.MkdirTemp(api.Options.CacheDir, "tfparse-*")
+	if err != nil {
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error checking workspace tags",
+			Detail:  "create tempdir: " + err.Error(),
+		})
+		return
+	}
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			api.Logger.Error(ctx, "failed to remove temporary tfparse dir", slog.Error(err))
+		}
+	}()
+
+	if err := tfparse.WriteArchive(file.Data, file.Mimetype, tempDir); err != nil {
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error checking workspace tags",
+			Detail:  "extract archive to tempdir: " + err.Error(),
+		})
+		return
+	}
+
+	parser, diags := tfparse.New(tempDir, tfparse.WithLogger(api.Logger.Named("tfparse")))
+	if diags.HasErrors() {
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error checking workspace tags",
+			Detail:  "parse module: " + diags.Error(),
+		})
+		return
+	}
+
+	parsedTags, err := parser.WorkspaceTagDefaults(ctx)
+	if err != nil {
+		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+			Message: "Internal error checking workspace tags",
+			Detail:  "evaluate default values of workspace tags: " + err.Error(),
+		})
+		return
+	}
+
+	// Ensure the "owner" tag is properly applied in addition to request tags and coder_workspace_tags.
+	// User-specified tags in the request will take precedence over tags parsed from `coder_workspace_tags`
+	// data sources defined in the template file.
+	tags := provisionersdk.MutateTags(apiKey.UserID, parsedTags, req.ProvisionerTags)
+
 	var templateVersion database.TemplateVersion
 	var provisionerJob database.ProvisionerJob
+	var warnings []codersdk.TemplateVersionWarning
+	var matchedProvisioners codersdk.MatchedProvisioners
 	err = api.Database.InTx(func(tx database.Store) error {
 		jobID := uuid.New()
 
@@ -1448,11 +1614,19 @@ func (api *API) postTemplateVersionsByOrganization(rw http.ResponseWriter, r *ht
 			UserVariableValues: req.UserVariableValues,
 		})
 		if err != nil {
-			return xerrors.Errorf("marshal job input: %w", err)
+			httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+				Message: "Internal error creating template version.",
+				Detail:  xerrors.Errorf("marshal job input: %w", err).Error(),
+			})
+			return err
 		}
 		traceMetadataRaw, err := json.Marshal(tracing.MetadataFromContext(ctx))
 		if err != nil {
-			return xerrors.Errorf("marshal job metadata: %w", err)
+			httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+				Message: "Internal error creating template version.",
+				Detail:  xerrors.Errorf("marshal job metadata: %w", err).Error(),
+			})
+			return err
 		}
 
 		provisionerJob, err = tx.InsertProvisionerJob(ctx, database.InsertProvisionerJobParams{
@@ -1473,7 +1647,41 @@ func (api *API) postTemplateVersionsByOrganization(rw http.ResponseWriter, r *ht
 			},
 		})
 		if err != nil {
-			return xerrors.Errorf("insert provisioner job: %w", err)
+			httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+				Message: "Internal error creating template version.",
+				Detail:  xerrors.Errorf("insert provisioner job: %w", err).Error(),
+			})
+			return err
+		}
+
+		// Check for eligible provisioners. This allows us to return a warning to the user if they
+		// submit a job for which no provisioner is available.
+		// nolint: gocritic // The user hitting this endpoint may not have
+		// permission to read provisioner daemons, but we want to show them
+		// information about the provisioner daemons that are available.
+		eligibleProvisioners, err := tx.GetProvisionerDaemonsByOrganization(dbauthz.AsSystemReadProvisionerDaemons(ctx), database.GetProvisionerDaemonsByOrganizationParams{
+			OrganizationID: organization.ID,
+			WantTags:       provisionerJob.Tags,
+		})
+		if err != nil {
+			// Log the error but do not return any warnings. This is purely advisory and we should not block.
+			api.Logger.Error(ctx, "failed to check eligible provisioner daemons for job", slog.Error(err))
+		}
+		matchedProvisioners = db2sdk.MatchedProvisioners(eligibleProvisioners, provisionerJob.CreatedAt, provisionerdserver.StaleInterval)
+		if matchedProvisioners.Count == 0 {
+			api.Logger.Warn(ctx, "no matching provisioners found for job",
+				slog.F("user_id", apiKey.UserID),
+				slog.F("job_id", jobID),
+				slog.F("job_type", database.ProvisionerJobTypeTemplateVersionImport),
+				slog.F("tags", tags),
+			)
+		} else if matchedProvisioners.Available == 0 {
+			api.Logger.Warn(ctx, "no active provisioners found for job",
+				slog.F("user_id", apiKey.UserID),
+				slog.F("job_id", jobID),
+				slog.F("job_type", database.ProvisionerJobTypeTemplateVersionImport),
+				slog.F("tags", tags),
+			)
 		}
 
 		var templateID uuid.NullUUID
@@ -1499,22 +1707,42 @@ func (api *API) postTemplateVersionsByOrganization(rw http.ResponseWriter, r *ht
 			Readme:         "",
 			JobID:          provisionerJob.ID,
 			CreatedBy:      apiKey.UserID,
+			SourceExampleID: sql.NullString{
+				String: req.ExampleID,
+				Valid:  req.ExampleID != "",
+			},
 		})
 		if err != nil {
-			return xerrors.Errorf("insert template version: %w", err)
+			if database.IsUniqueViolation(err, database.UniqueTemplateVersionsTemplateIDNameKey) {
+				httpapi.Write(ctx, rw, http.StatusConflict, codersdk.Response{
+					Message: fmt.Sprintf("A template version with name %q already exists for this template.", req.Name),
+					Validations: []codersdk.ValidationError{{
+						Field:  "name",
+						Detail: "This value is already in use and should be unique.",
+					}},
+				})
+				return err
+			}
+			httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+				Message: "Internal error creating template version.",
+				Detail:  xerrors.Errorf("insert template version: %w", err).Error(),
+			})
+			return err
 		}
 
 		templateVersion, err = tx.GetTemplateVersionByID(ctx, templateVersionID)
 		if err != nil {
-			return xerrors.Errorf("fetched inserted template version: %w", err)
+			httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
+				Message: "Internal error creating template version.",
+				Detail:  xerrors.Errorf("fetched inserted template version: %w", err).Error(),
+			})
+			return err
 		}
 
 		return nil
 	}, nil)
 	if err != nil {
-		httpapi.Write(ctx, rw, http.StatusInternalServerError, codersdk.Response{
-			Message: err.Error(),
-		})
+		// Each failure case in the tx should have already written a response.
 		return
 	}
 	aReq.New = templateVersion
@@ -1524,10 +1752,14 @@ func (api *API) postTemplateVersionsByOrganization(rw http.ResponseWriter, r *ht
 		api.Logger.Error(ctx, "failed to post provisioner job to pubsub", slog.Error(err))
 	}
 
-	httpapi.Write(ctx, rw, http.StatusCreated, convertTemplateVersion(templateVersion, convertProvisionerJob(database.GetProvisionerJobsByIDsWithQueuePositionRow{
-		ProvisionerJob: provisionerJob,
-		QueuePosition:  0,
-	}), nil))
+	httpapi.Write(ctx, rw, http.StatusCreated, convertTemplateVersion(
+		templateVersion,
+		convertProvisionerJob(database.GetProvisionerJobsByIDsWithQueuePositionRow{
+			ProvisionerJob: provisionerJob,
+			QueuePosition:  0,
+		}),
+		&matchedProvisioners,
+		warnings))
 }
 
 // templateVersionResources returns the workspace agent resources associated
@@ -1594,7 +1826,7 @@ func (api *API) templateVersionLogs(rw http.ResponseWriter, r *http.Request) {
 	api.provisionerJobLogs(rw, r, job)
 }
 
-func convertTemplateVersion(version database.TemplateVersion, job codersdk.ProvisionerJob, warnings []codersdk.TemplateVersionWarning) codersdk.TemplateVersion {
+func convertTemplateVersion(version database.TemplateVersion, job codersdk.ProvisionerJob, matchedProvisioners *codersdk.MatchedProvisioners, warnings []codersdk.TemplateVersionWarning) codersdk.TemplateVersion {
 	return codersdk.TemplateVersion{
 		ID:             version.ID,
 		TemplateID:     &version.TemplateID.UUID,
@@ -1610,8 +1842,9 @@ func convertTemplateVersion(version database.TemplateVersion, job codersdk.Provi
 			Username:  version.CreatedByUsername,
 			AvatarURL: version.CreatedByAvatarURL,
 		},
-		Archived: version.Archived,
-		Warnings: warnings,
+		Archived:            version.Archived,
+		Warnings:            warnings,
+		MatchedProvisioners: matchedProvisioners,
 	}
 }
 

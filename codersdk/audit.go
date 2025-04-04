@@ -30,9 +30,15 @@ const (
 	ResourceTypeOrganization          ResourceType = "organization"
 	ResourceTypeOAuth2ProviderApp     ResourceType = "oauth2_provider_app"
 	// nolint:gosec // This is not a secret.
-	ResourceTypeOAuth2ProviderAppSecret ResourceType = "oauth2_provider_app_secret"
-	ResourceTypeCustomRole              ResourceType = "custom_role"
-	ResourceTypeOrganizationMember                   = "organization_member"
+	ResourceTypeOAuth2ProviderAppSecret     ResourceType = "oauth2_provider_app_secret"
+	ResourceTypeCustomRole                  ResourceType = "custom_role"
+	ResourceTypeOrganizationMember          ResourceType = "organization_member"
+	ResourceTypeNotificationTemplate        ResourceType = "notification_template"
+	ResourceTypeIdpSyncSettingsOrganization ResourceType = "idp_sync_settings_organization"
+	ResourceTypeIdpSyncSettingsGroup        ResourceType = "idp_sync_settings_group"
+	ResourceTypeIdpSyncSettingsRole         ResourceType = "idp_sync_settings_role"
+	ResourceTypeWorkspaceAgent              ResourceType = "workspace_agent"
+	ResourceTypeWorkspaceApp                ResourceType = "workspace_app"
 )
 
 func (r ResourceType) FriendlyString() string {
@@ -75,6 +81,18 @@ func (r ResourceType) FriendlyString() string {
 		return "custom role"
 	case ResourceTypeOrganizationMember:
 		return "organization member"
+	case ResourceTypeNotificationTemplate:
+		return "notification template"
+	case ResourceTypeIdpSyncSettingsOrganization:
+		return "settings"
+	case ResourceTypeIdpSyncSettingsGroup:
+		return "settings"
+	case ResourceTypeIdpSyncSettingsRole:
+		return "settings"
+	case ResourceTypeWorkspaceAgent:
+		return "workspace agent"
+	case ResourceTypeWorkspaceApp:
+		return "workspace app"
 	default:
 		return "unknown"
 	}
@@ -83,14 +101,19 @@ func (r ResourceType) FriendlyString() string {
 type AuditAction string
 
 const (
-	AuditActionCreate   AuditAction = "create"
-	AuditActionWrite    AuditAction = "write"
-	AuditActionDelete   AuditAction = "delete"
-	AuditActionStart    AuditAction = "start"
-	AuditActionStop     AuditAction = "stop"
-	AuditActionLogin    AuditAction = "login"
-	AuditActionLogout   AuditAction = "logout"
-	AuditActionRegister AuditAction = "register"
+	AuditActionCreate               AuditAction = "create"
+	AuditActionWrite                AuditAction = "write"
+	AuditActionDelete               AuditAction = "delete"
+	AuditActionStart                AuditAction = "start"
+	AuditActionStop                 AuditAction = "stop"
+	AuditActionLogin                AuditAction = "login"
+	AuditActionLogout               AuditAction = "logout"
+	AuditActionRegister             AuditAction = "register"
+	AuditActionRequestPasswordReset AuditAction = "request_password_reset"
+	AuditActionConnect              AuditAction = "connect"
+	AuditActionDisconnect           AuditAction = "disconnect"
+	AuditActionOpen                 AuditAction = "open"
+	AuditActionClose                AuditAction = "close"
 )
 
 func (a AuditAction) Friendly() string {
@@ -111,6 +134,16 @@ func (a AuditAction) Friendly() string {
 		return "logged out"
 	case AuditActionRegister:
 		return "registered"
+	case AuditActionRequestPasswordReset:
+		return "password reset requested"
+	case AuditActionConnect:
+		return "connected"
+	case AuditActionDisconnect:
+		return "disconnected"
+	case AuditActionOpen:
+		return "opened"
+	case AuditActionClose:
+		return "closed"
 	default:
 		return "unknown"
 	}
@@ -169,6 +202,7 @@ type CreateTestAuditLogRequest struct {
 	Time             time.Time       `json:"time,omitempty" format:"date-time"`
 	BuildReason      BuildReason     `json:"build_reason,omitempty" enums:"autostart,autostop,initiator"`
 	OrganizationID   uuid.UUID       `json:"organization_id,omitempty" format:"uuid"`
+	RequestID        uuid.UUID       `json:"request_id,omitempty" format:"uuid"`
 }
 
 // AuditLogs retrieves audit logs from the given page.

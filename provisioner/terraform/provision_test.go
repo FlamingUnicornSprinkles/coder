@@ -3,15 +3,14 @@
 package terraform_test
 
 import (
-	"archive/tar"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -26,11 +25,14 @@ import (
 	"github.com/coder/coder/v2/provisioner/terraform"
 	"github.com/coder/coder/v2/provisionersdk"
 	"github.com/coder/coder/v2/provisionersdk/proto"
+	"github.com/coder/coder/v2/testutil"
 )
 
 type provisionerServeOptions struct {
 	binaryPath  string
 	exitTimeout time.Duration
+	workDir     string
+	logger      *slog.Logger
 }
 
 func setupProvisioner(t *testing.T, opts *provisionerServeOptions) (context.Context, proto.DRPCProvisionerClient) {
@@ -38,7 +40,13 @@ func setupProvisioner(t *testing.T, opts *provisionerServeOptions) (context.Cont
 		opts = &provisionerServeOptions{}
 	}
 	cachePath := t.TempDir()
-	workDir := t.TempDir()
+	if opts.workDir == "" {
+		opts.workDir = t.TempDir()
+	}
+	if opts.logger == nil {
+		logger := testutil.Logger(t)
+		opts.logger = &logger
+	}
 	client, server := drpc.MemTransportPipe()
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	serverErr := make(chan error, 1)
@@ -55,8 +63,8 @@ func setupProvisioner(t *testing.T, opts *provisionerServeOptions) (context.Cont
 		serverErr <- terraform.Serve(ctx, &terraform.ServeOptions{
 			ServeOptions: &provisionersdk.ServeOptions{
 				Listener:      server,
-				Logger:        slogtest.Make(t, nil).Leveled(slog.LevelDebug),
-				WorkDirectory: workDir,
+				Logger:        *opts.logger,
+				WorkDirectory: opts.workDir,
 			},
 			BinaryPath:  opts.binaryPath,
 			CachePath:   cachePath,
@@ -66,25 +74,6 @@ func setupProvisioner(t *testing.T, opts *provisionerServeOptions) (context.Cont
 	api := proto.NewDRPCProvisionerClient(client)
 
 	return ctx, api
-}
-
-func makeTar(t *testing.T, files map[string]string) []byte {
-	t.Helper()
-	var buffer bytes.Buffer
-	writer := tar.NewWriter(&buffer)
-	for name, content := range files {
-		err := writer.WriteHeader(&tar.Header{
-			Name: name,
-			Size: int64(len(content)),
-			Mode: 0o644,
-		})
-		require.NoError(t, err)
-		_, err = writer.Write([]byte(content))
-		require.NoError(t, err)
-	}
-	err := writer.Flush()
-	require.NoError(t, err)
-	return buffer.Bytes()
 }
 
 func configure(ctx context.Context, t *testing.T, client proto.DRPCProvisionerClient, config *proto.Config) proto.DRPCProvisioner_SessionClient {
@@ -129,10 +118,6 @@ func sendApply(sess proto.DRPCProvisioner_SessionClient, transition proto.Worksp
 // one process tries to do this simultaneously, it can cause "text file busy"
 // nolint: paralleltest
 func TestProvision_Cancel(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("This test uses interrupts and is not supported on Windows")
-	}
-
 	cwd, err := os.Getwd()
 	require.NoError(t, err)
 	fakeBin := filepath.Join(cwd, "testdata", "fake_cancel.sh")
@@ -176,7 +161,7 @@ func TestProvision_Cancel(t *testing.T) {
 				binaryPath: binPath,
 			})
 			sess := configure(ctx, t, api, &proto.Config{
-				TemplateSourceArchive: makeTar(t, nil),
+				TemplateSourceArchive: testutil.CreateTar(t, nil),
 			})
 
 			err = sendPlan(sess, proto.WorkspaceTransition_START)
@@ -225,10 +210,6 @@ func TestProvision_Cancel(t *testing.T) {
 // one process tries to do this, it can cause "text file busy"
 // nolint: paralleltest
 func TestProvision_CancelTimeout(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("This test uses interrupts and is not supported on Windows")
-	}
-
 	cwd, err := os.Getwd()
 	require.NoError(t, err)
 	fakeBin := filepath.Join(cwd, "testdata", "fake_cancel_hang.sh")
@@ -236,7 +217,7 @@ func TestProvision_CancelTimeout(t *testing.T) {
 	dir := t.TempDir()
 	binPath := filepath.Join(dir, "terraform")
 
-	// Example: exec /path/to/terrafork_fake_cancel.sh 1.2.1 apply "$@"
+	// Example: exec /path/to/terraform_fake_cancel.sh 1.2.1 apply "$@"
 	content := fmt.Sprintf("#!/bin/sh\nexec %q %s \"$@\"\n", fakeBin, terraform.TerraformVersion.String())
 	err = os.WriteFile(binPath, []byte(content), 0o755) //#nosec
 	require.NoError(t, err)
@@ -247,7 +228,7 @@ func TestProvision_CancelTimeout(t *testing.T) {
 	})
 
 	sess := configure(ctx, t, api, &proto.Config{
-		TemplateSourceArchive: makeTar(t, nil),
+		TemplateSourceArchive: testutil.CreateTar(t, nil),
 	})
 
 	// provisioner requires plan before apply, so test cancel with plan.
@@ -282,6 +263,77 @@ func TestProvision_CancelTimeout(t *testing.T) {
 	}
 }
 
+// below we exec fake_text_file_busy.sh, which causes the kernel to execute it, and if more than
+// one process tries to do this, it can cause "text file busy" to be returned to us. In this test
+// we want to simulate "text file busy" getting logged by terraform, due to an issue with the
+// terraform-provider-coder
+// nolint: paralleltest
+func TestProvision_TextFileBusy(t *testing.T) {
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	fakeBin := filepath.Join(cwd, "testdata", "fake_text_file_busy.sh")
+
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "terraform")
+
+	// Example: exec /path/to/terraform_fake_cancel.sh 1.2.1 apply "$@"
+	content := fmt.Sprintf("#!/bin/sh\nexec %q %s \"$@\"\n", fakeBin, terraform.TerraformVersion.String())
+	err = os.WriteFile(binPath, []byte(content), 0o755) //#nosec
+	require.NoError(t, err)
+
+	workDir := t.TempDir()
+
+	err = os.Mkdir(filepath.Join(workDir, ".coder"), 0o700)
+	require.NoError(t, err)
+	l, err := net.Listen("unix", filepath.Join(workDir, ".coder", "pprof"))
+	require.NoError(t, err)
+	defer l.Close()
+	handlerCalled := 0
+	// nolint: gosec
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "/debug/pprof/goroutine", r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+			_, err := w.Write([]byte("thestacks\n"))
+			assert.NoError(t, err)
+			handlerCalled++
+		}),
+	}
+	srvErr := make(chan error, 1)
+	go func() {
+		srvErr <- srv.Serve(l)
+	}()
+
+	logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true})
+	ctx, api := setupProvisioner(t, &provisionerServeOptions{
+		binaryPath:  binPath,
+		exitTimeout: time.Second,
+		workDir:     workDir,
+		logger:      &logger,
+	})
+
+	sess := configure(ctx, t, api, &proto.Config{
+		TemplateSourceArchive: testutil.CreateTar(t, nil),
+	})
+
+	err = sendPlan(sess, proto.WorkspaceTransition_START)
+	require.NoError(t, err)
+
+	found := false
+	for {
+		msg, err := sess.Recv()
+		require.NoError(t, err)
+
+		if c := msg.GetPlan(); c != nil {
+			require.Contains(t, c.Error, "exit status 1")
+			found = true
+			break
+		}
+	}
+	require.True(t, found)
+	require.EqualValues(t, 1, handlerCalled)
+}
+
 func TestProvision(t *testing.T) {
 	t.Parallel()
 
@@ -298,6 +350,8 @@ func TestProvision(t *testing.T) {
 		ExpectLogContains string
 		// If Apply is true, then send an Apply request and check we get the same Resources as in Response.
 		Apply bool
+		// Some tests may need to be skipped until the relevant provider version is released.
+		SkipReason string
 	}{
 		{
 			Name: "missing-variable",
@@ -618,6 +672,132 @@ func TestProvision(t *testing.T) {
 				}},
 			},
 		},
+		{
+			Name:       "workspace-owner-login-type",
+			SkipReason: "field will be added in provider version 1.1.0",
+			Files: map[string]string{
+				"main.tf": `terraform {
+					required_providers {
+					  coder = {
+						source  = "coder/coder"
+						version = "1.1.0"
+					  }
+					}
+				}
+
+				resource "null_resource" "example" {}
+				data "coder_workspace_owner" "me" {}
+				resource "coder_metadata" "example" {
+					resource_id = null_resource.example.id
+					item {
+						key = "login_type"
+						value = data.coder_workspace_owner.me.login_type
+					}
+				}
+				`,
+			},
+			Request: &proto.PlanRequest{
+				Metadata: &proto.Metadata{
+					WorkspaceOwnerLoginType: "github",
+				},
+			},
+			Response: &proto.PlanComplete{
+				Resources: []*proto.Resource{{
+					Name: "example",
+					Type: "null_resource",
+					Metadata: []*proto.Resource_Metadata{{
+						Key:   "login_type",
+						Value: "github",
+					}},
+				}},
+			},
+		},
+		{
+			Name: "returns-modules",
+			Files: map[string]string{
+				"main.tf": `module "hello" {
+                    source = "./module"
+                  }`,
+				"module/module.tf": `
+				  resource "null_resource" "example" {}
+
+				  module "there" {
+					source = "./inner_module"
+				  }
+				`,
+				"module/inner_module/inner_module.tf": `
+				  resource "null_resource" "inner_example" {}
+				`,
+			},
+			Request: &proto.PlanRequest{},
+			Response: &proto.PlanComplete{
+				Resources: []*proto.Resource{{
+					Name:       "example",
+					Type:       "null_resource",
+					ModulePath: "module.hello",
+				}, {
+					Name:       "inner_example",
+					Type:       "null_resource",
+					ModulePath: "module.hello.module.there",
+				}},
+				Modules: []*proto.Module{{
+					Key:     "hello",
+					Version: "",
+					Source:  "./module",
+				}, {
+					Key:     "hello.there",
+					Version: "",
+					Source:  "./inner_module",
+				}},
+			},
+		},
+		{
+			Name:       "workspace-owner-rbac-roles",
+			SkipReason: "field will be added in provider version 2.2.0",
+			Files: map[string]string{
+				"main.tf": `terraform {
+					required_providers {
+					  coder = {
+						source  = "coder/coder"
+						version = "2.2.0"
+					  }
+					}
+				}
+
+				resource "null_resource" "example" {}
+				data "coder_workspace_owner" "me" {}
+				resource "coder_metadata" "example" {
+					resource_id = null_resource.example.id
+					item {
+						key = "rbac_roles_name"
+						value = data.coder_workspace_owner.me.rbac_roles[0].name
+					}
+					item {
+						key = "rbac_roles_org_id"
+						value = data.coder_workspace_owner.me.rbac_roles[0].org_id
+					}
+				}
+				`,
+			},
+			Request: &proto.PlanRequest{
+				Metadata: &proto.Metadata{
+					WorkspaceOwnerRbacRoles: []*proto.Role{{Name: "member", OrgId: ""}},
+				},
+			},
+			Response: &proto.PlanComplete{
+				Resources: []*proto.Resource{{
+					Name: "example",
+					Type: "null_resource",
+					Metadata: []*proto.Resource_Metadata{{
+						Key:   "rbac_roles_name",
+						Value: "member",
+					}, {
+						Key:   "rbac_roles_org_id",
+						Value: "",
+					}},
+				}},
+			},
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -625,9 +805,13 @@ func TestProvision(t *testing.T) {
 		t.Run(testCase.Name, func(t *testing.T) {
 			t.Parallel()
 
+			if testCase.SkipReason != "" {
+				t.Skip(testCase.SkipReason)
+			}
+
 			ctx, api := setupProvisioner(t, nil)
 			sess := configure(ctx, t, api, &proto.Config{
-				TemplateSourceArchive: makeTar(t, testCase.Files),
+				TemplateSourceArchive: testutil.CreateTar(t, testCase.Files),
 			})
 
 			planRequest := &proto.Request{Type: &proto.Request_Plan{Plan: &proto.PlanRequest{
@@ -668,7 +852,7 @@ func TestProvision(t *testing.T) {
 			if testCase.Response != nil {
 				require.Equal(t, testCase.Response.Error, planComplete.Error)
 
-				// Remove randomly generated data.
+				// Remove randomly generated data and sort by name.
 				normalizeResources(planComplete.Resources)
 				resourcesGot, err := json.Marshal(planComplete.Resources)
 				require.NoError(t, err)
@@ -681,6 +865,12 @@ func TestProvision(t *testing.T) {
 				parametersWant, err := json.Marshal(testCase.Response.Parameters)
 				require.NoError(t, err)
 				require.Equal(t, string(parametersWant), string(parametersGot))
+
+				modulesGot, err := json.Marshal(planComplete.Modules)
+				require.NoError(t, err)
+				modulesWant, err := json.Marshal(testCase.Response.Modules)
+				require.NoError(t, err)
+				require.Equal(t, string(modulesWant), string(modulesGot))
 			}
 
 			if testCase.Apply {
@@ -721,6 +911,9 @@ func normalizeResources(resources []*proto.Resource) {
 			agent.Auth = &proto.Agent_Token{}
 		}
 	}
+	sort.Slice(resources, func(i, j int) bool {
+		return resources[i].Name < resources[j].Name
+	})
 }
 
 // nolint:paralleltest
@@ -732,7 +925,7 @@ func TestProvision_ExtraEnv(t *testing.T) {
 
 	ctx, api := setupProvisioner(t, nil)
 	sess := configure(ctx, t, api, &proto.Config{
-		TemplateSourceArchive: makeTar(t, map[string]string{"main.tf": `resource "null_resource" "A" {}`}),
+		TemplateSourceArchive: testutil.CreateTar(t, map[string]string{"main.tf": `resource "null_resource" "A" {}`}),
 	})
 
 	err := sendPlan(sess, proto.WorkspaceTransition_START)
@@ -782,7 +975,7 @@ func TestProvision_SafeEnv(t *testing.T) {
 
 	ctx, api := setupProvisioner(t, nil)
 	sess := configure(ctx, t, api, &proto.Config{
-		TemplateSourceArchive: makeTar(t, map[string]string{"main.tf": echoResource}),
+		TemplateSourceArchive: testutil.CreateTar(t, map[string]string{"main.tf": echoResource}),
 	})
 
 	err := sendPlan(sess, proto.WorkspaceTransition_START)
@@ -797,4 +990,21 @@ func TestProvision_SafeEnv(t *testing.T) {
 	require.Contains(t, log, passedValue)
 	require.NotContains(t, log, secretValue)
 	require.Contains(t, log, "CODER_")
+}
+
+func TestProvision_MalformedModules(t *testing.T) {
+	t.Parallel()
+
+	ctx, api := setupProvisioner(t, nil)
+	sess := configure(ctx, t, api, &proto.Config{
+		TemplateSourceArchive: testutil.CreateTar(t, map[string]string{
+			"main.tf":          `module "hello" { source = "./module" }`,
+			"module/module.tf": `resource "null_`,
+		}),
+	})
+
+	err := sendPlan(sess, proto.WorkspaceTransition_START)
+	require.NoError(t, err)
+	log := readProvisionLog(t, sess)
+	require.Contains(t, log, "Invalid block definition")
 }

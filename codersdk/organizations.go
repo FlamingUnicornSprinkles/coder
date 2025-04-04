@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,7 +44,7 @@ func ProvisionerTypeValid[T ProvisionerType | string](pt T) error {
 type MinimalOrganization struct {
 	ID          uuid.UUID `table:"id" json:"id" validate:"required" format:"uuid"`
 	Name        string    `table:"name,default_sort" json:"name"`
-	DisplayName string    `table:"display_name" json:"display_name"`
+	DisplayName string    `table:"display name" json:"display_name"`
 	Icon        string    `table:"icon" json:"icon"`
 }
 
@@ -50,8 +52,8 @@ type MinimalOrganization struct {
 type Organization struct {
 	MinimalOrganization `table:"m,recursive_inline"`
 	Description         string    `table:"description" json:"description"`
-	CreatedAt           time.Time `table:"created_at" json:"created_at" validate:"required" format:"date-time"`
-	UpdatedAt           time.Time `table:"updated_at" json:"updated_at" validate:"required" format:"date-time"`
+	CreatedAt           time.Time `table:"created at" json:"created_at" validate:"required" format:"date-time"`
+	UpdatedAt           time.Time `table:"updated at" json:"updated_at" validate:"required" format:"date-time"`
 	IsDefault           bool      `table:"default" json:"is_default" validate:"required"`
 }
 
@@ -67,7 +69,7 @@ type OrganizationMember struct {
 	OrganizationID uuid.UUID  `table:"organization id" json:"organization_id" format:"uuid"`
 	CreatedAt      time.Time  `table:"created at" json:"created_at" format:"date-time"`
 	UpdatedAt      time.Time  `table:"updated at" json:"updated_at" format:"date-time"`
-	Roles          []SlimRole `table:"organization_roles" json:"roles"`
+	Roles          []SlimRole `table:"organization roles" json:"roles"`
 }
 
 type OrganizationMemberWithUserData struct {
@@ -77,6 +79,16 @@ type OrganizationMemberWithUserData struct {
 	Email              string     `json:"email"`
 	GlobalRoles        []SlimRole `json:"global_roles"`
 	OrganizationMember `table:"m,recursive_inline"`
+}
+
+type PaginatedMembersRequest struct {
+	Limit  int `json:"limit,omitempty"`
+	Offset int `json:"offset,omitempty"`
+}
+
+type PaginatedMembersResponse struct {
+	Members []OrganizationMemberWithUserData `json:"members"`
+	Count   int                              `json:"count"`
 }
 
 type CreateOrganizationRequest struct {
@@ -156,13 +168,13 @@ type CreateTemplateRequest struct {
 	// AllowUserAutostart allows users to set a schedule for autostarting their
 	// workspace. By default this is true. This can only be disabled when using
 	// an enterprise license.
-	AllowUserAutostart *bool `json:"allow_user_autostart"`
+	AllowUserAutostart *bool `json:"allow_user_autostart,omitempty"`
 
 	// AllowUserAutostop allows users to set a custom workspace TTL to use in
 	// place of the template's DefaultTTL field. By default this is true. If
 	// false, the DefaultTTL will always be used. This can only be disabled when
 	// using an enterprise license.
-	AllowUserAutostop *bool `json:"allow_user_autostop"`
+	AllowUserAutostop *bool `json:"allow_user_autostop,omitempty"`
 
 	// FailureTTLMillis allows optionally specifying the max lifetime before Coder
 	// stops all resources for failed workspaces created from this template.
@@ -184,6 +196,10 @@ type CreateTemplateRequest struct {
 	// RequireActiveVersion mandates that workspaces are built with the active
 	// template version.
 	RequireActiveVersion bool `json:"require_active_version"`
+
+	// MaxPortShareLevel allows optionally specifying the maximum port share level
+	// for workspaces created from the template.
+	MaxPortShareLevel *WorkspaceAgentPortShareLevel `json:"max_port_share_level"`
 }
 
 // CreateWorkspaceRequest provides options for creating a new workspace.
@@ -197,7 +213,7 @@ type CreateWorkspaceRequest struct {
 	// TemplateVersionID can be used to specify a specific version of a template for creating the workspace.
 	TemplateVersionID uuid.UUID `json:"template_version_id,omitempty" validate:"required_without=TemplateID,excluded_with=TemplateID" format:"uuid"`
 	Name              string    `json:"name" validate:"workspace_name,required"`
-	AutostartSchedule *string   `json:"autostart_schedule"`
+	AutostartSchedule *string   `json:"autostart_schedule,omitempty"`
 	TTLMillis         *int64    `json:"ttl_ms,omitempty"`
 	// RichParameterValues allows for additional parameters to be provided
 	// during the initial provision.
@@ -310,9 +326,32 @@ func (c *Client) ProvisionerDaemons(ctx context.Context) ([]ProvisionerDaemon, e
 	return daemons, json.NewDecoder(res.Body).Decode(&daemons)
 }
 
-func (c *Client) OrganizationProvisionerDaemons(ctx context.Context, organizationID uuid.UUID) ([]ProvisionerDaemon, error) {
+type OrganizationProvisionerDaemonsOptions struct {
+	Limit int
+	IDs   []uuid.UUID
+	Tags  map[string]string
+}
+
+func (c *Client) OrganizationProvisionerDaemons(ctx context.Context, organizationID uuid.UUID, opts *OrganizationProvisionerDaemonsOptions) ([]ProvisionerDaemon, error) {
+	qp := url.Values{}
+	if opts != nil {
+		if opts.Limit > 0 {
+			qp.Add("limit", strconv.Itoa(opts.Limit))
+		}
+		if len(opts.IDs) > 0 {
+			qp.Add("ids", joinSliceStringer(opts.IDs))
+		}
+		if len(opts.Tags) > 0 {
+			tagsRaw, err := json.Marshal(opts.Tags)
+			if err != nil {
+				return nil, xerrors.Errorf("marshal tags: %w", err)
+			}
+			qp.Add("tags", string(tagsRaw))
+		}
+	}
+
 	res, err := c.Request(ctx, http.MethodGet,
-		fmt.Sprintf("/api/v2/organizations/%s/provisionerdaemons", organizationID.String()),
+		fmt.Sprintf("/api/v2/organizations/%s/provisionerdaemons?%s", organizationID.String(), qp.Encode()),
 		nil,
 	)
 	if err != nil {
@@ -326,6 +365,83 @@ func (c *Client) OrganizationProvisionerDaemons(ctx context.Context, organizatio
 
 	var daemons []ProvisionerDaemon
 	return daemons, json.NewDecoder(res.Body).Decode(&daemons)
+}
+
+type OrganizationProvisionerJobsOptions struct {
+	Limit  int
+	IDs    []uuid.UUID
+	Status []ProvisionerJobStatus
+	Tags   map[string]string
+}
+
+func (c *Client) OrganizationProvisionerJobs(ctx context.Context, organizationID uuid.UUID, opts *OrganizationProvisionerJobsOptions) ([]ProvisionerJob, error) {
+	qp := url.Values{}
+	if opts != nil {
+		if opts.Limit > 0 {
+			qp.Add("limit", strconv.Itoa(opts.Limit))
+		}
+		if len(opts.IDs) > 0 {
+			qp.Add("ids", joinSliceStringer(opts.IDs))
+		}
+		if len(opts.Status) > 0 {
+			qp.Add("status", joinSlice(opts.Status))
+		}
+		if len(opts.Tags) > 0 {
+			tagsRaw, err := json.Marshal(opts.Tags)
+			if err != nil {
+				return nil, xerrors.Errorf("marshal tags: %w", err)
+			}
+			qp.Add("tags", string(tagsRaw))
+		}
+	}
+
+	res, err := c.Request(ctx, http.MethodGet,
+		fmt.Sprintf("/api/v2/organizations/%s/provisionerjobs?%s", organizationID.String(), qp.Encode()),
+		nil,
+	)
+	if err != nil {
+		return nil, xerrors.Errorf("make request: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, ReadBodyAsError(res)
+	}
+
+	var jobs []ProvisionerJob
+	return jobs, json.NewDecoder(res.Body).Decode(&jobs)
+}
+
+func (c *Client) OrganizationProvisionerJob(ctx context.Context, organizationID, jobID uuid.UUID) (job ProvisionerJob, err error) {
+	res, err := c.Request(ctx, http.MethodGet,
+		fmt.Sprintf("/api/v2/organizations/%s/provisionerjobs/%s", organizationID.String(), jobID.String()),
+		nil,
+	)
+	if err != nil {
+		return job, xerrors.Errorf("make request: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return job, ReadBodyAsError(res)
+	}
+	return job, json.NewDecoder(res.Body).Decode(&job)
+}
+
+func joinSlice[T ~string](s []T) string {
+	var ss []string
+	for _, v := range s {
+		ss = append(ss, string(v))
+	}
+	return strings.Join(ss, ",")
+}
+
+func joinSliceStringer[T fmt.Stringer](s []T) string {
+	var ss []string
+	for _, v := range s {
+		ss = append(ss, v.String())
+	}
+	return strings.Join(ss, ",")
 }
 
 // CreateTemplateVersion processes source-code and optionally associates the version with a template.
@@ -405,8 +521,10 @@ func (c *Client) TemplatesByOrganization(ctx context.Context, organizationID uui
 }
 
 type TemplateFilter struct {
-	OrganizationID uuid.UUID
-	ExactName      string
+	OrganizationID uuid.UUID `typescript:"-"`
+	ExactName      string    `typescript:"-"`
+	FuzzyName      string    `typescript:"-"`
+	SearchQuery    string    `json:"q,omitempty"`
 }
 
 // asRequestOption returns a function that can be used in (*Client).Request.
@@ -422,6 +540,13 @@ func (f TemplateFilter) asRequestOption() RequestOption {
 
 		if f.ExactName != "" {
 			params = append(params, fmt.Sprintf("exact_name:%q", f.ExactName))
+		}
+
+		if f.FuzzyName != "" {
+			params = append(params, fmt.Sprintf("name:%q", f.FuzzyName))
+		}
+		if f.SearchQuery != "" {
+			params = append(params, f.SearchQuery)
 		}
 
 		q := r.URL.Query()
